@@ -308,7 +308,8 @@ class Monitor:
                 with self.lock:
                     self.summary = s
                     self.last_ok = time.time()
-                print(f"[status] {s['overall']} {s['counts']} problems={len(s['problems'])}")
+                print(f"[status] {s['overall']} {s['counts']} problems={len(s['problems'])}"
+                      + "".join(f"\n  {p['state']:5} {p['name']} ({p['where']}): {p['why']}" for p in s['problems']), flush=True)
             except Exception:
                 traceback.print_exc()
             time.sleep(self.poll)
