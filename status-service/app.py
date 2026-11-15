@@ -25,6 +25,10 @@ Environment
                          e.g. COOLIFY_TOKEN_VAROAPPS_1 (permission "read" is enough)
   EXTRA_URLS             optional "Label=https://...,Label=https://..." to check too
   IGNORE                 optional comma list of resource names to leave out
+  PORT_CHECKS            optional "Label=host:port,..." TCP services to check (mail etc.).
+                         465/993/995 are checked over TLS; 25/587/465 must greet with 220,
+                         993/143 with "* OK". A TLS certificate within CERT_WARN_DAYS
+                         (default 14) of expiry is a warning.
   POLL_SECONDS           default 60
   CPU_WARN               default 90 (percent, 5-minute average)
 """
@@ -40,6 +44,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+
+import socket
+import ssl
 
 import requests
 
@@ -199,6 +206,52 @@ def coolify_instance(name: str, base: str, token: str) -> dict:
     return {"servers": [s["_srv"] for s in servers], "resources": placed}
 
 
+# ------------------------------------------------------------------ port checks
+
+IMPLICIT_TLS = {465, 993, 995}
+GREETING = {25: b"220", 465: b"220", 587: b"220", 143: b"* OK", 993: b"* OK", 110: b"+OK", 995: b"+OK"}
+
+
+def port_check(host: str, port: int, warn_days: int) -> tuple[str, str]:
+    """('up'|'warn'|'down', why). Connects, does TLS on implicit-TLS ports (verifying the
+    certificate against host), and reads the greeting where the protocol has one."""
+    try:
+        raw = socket.create_connection((host, port), timeout=10)
+    except OSError as e:
+        return "down", "no connection" if not isinstance(e, socket.timeout) else "timed out"
+    sock = raw
+    try:
+        cert_days = None
+        if port in IMPLICIT_TLS:
+            ctx = ssl.create_default_context()
+            try:
+                sock = ctx.wrap_socket(raw, server_hostname=host)
+            except ssl.SSLCertVerificationError as e:
+                return "down", "certificate " + ("expired" if "expired" in str(e) else "invalid")
+            except (ssl.SSLError, OSError):
+                return "down", "TLS failed"
+            exp = sock.getpeercert().get("notAfter")
+            if exp:
+                cert_days = int((ssl.cert_time_to_seconds(exp) - time.time()) // 86400)
+        want = GREETING.get(port)
+        if want:
+            sock.settimeout(10)
+            try:
+                hello = sock.recv(256)
+            except OSError:
+                return "down", "no greeting"
+            if not hello.startswith(want):
+                return "down", "bad greeting"
+        if cert_days is not None and cert_days < warn_days:
+            return "warn", f"certificate expires in {cert_days}d"
+        return "up", "ok"
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 # ------------------------------------------------------------------ monitor
 
 class Monitor:
@@ -219,6 +272,13 @@ class Monitor:
             if "=" in part:
                 n, u = part.split("=", 1)
                 self.extra.append((n.strip(), u.strip()))
+        self.ports = []
+        for part in os.environ.get("PORT_CHECKS", "").split(","):
+            if "=" in part and ":" in part.split("=", 1)[1]:
+                n, hp = part.split("=", 1)
+                h, pt = hp.strip().rsplit(":", 1)
+                self.ports.append((n.strip(), h.strip(), int(pt)))
+        self.cert_warn = int(os.environ.get("CERT_WARN_DAYS", "14"))
         self.ignore = {x.strip().lower() for x in os.environ.get("IGNORE", "").split(",") if x.strip()}
         self.cpu_warn = float(os.environ.get("CPU_WARN", "90"))
         self.poll = max(30, int(os.environ.get("POLL_SECONDS", "60")))
@@ -269,8 +329,10 @@ class Monitor:
         results = {}
         with ThreadPoolExecutor(max_workers=8) as ex:
             futs = {k: ex.submit(http_check, u) for k, u in urls.items()}
+            pfuts = {(n, h, pt): ex.submit(port_check, h, pt, self.cert_warn) for n, h, pt in self.ports}
             for k, f in futs.items():
                 results[k] = f.result()
+            port_results = {k: f.result() for k, f in pfuts.items()}
 
         dots = []
         counts = {"up": 0, "warn": 0, "down": 0, "stopped": 0}
@@ -291,6 +353,11 @@ class Monitor:
         for sv in servers:                 # Hetzner servers get a dot each too
             counts[sv["state"]] += 1
             dots.append(sv["state"][0].upper())
+        for (n, h, pt), (state, why) in port_results.items():
+            counts[state] += 1
+            dots.append(state[0].upper())
+            if state != "up":
+                problems.append({"name": n, "where": f"{h}:{pt}", "state": state, "why": why})
         for (n, u) in self.extra:
             ok, why = results[f"extra:{n}"]
             state = "up" if ok else "down"

@@ -10,8 +10,8 @@ more Coolify instances, and every public domain, rolled up into one small JSON.
 
 | state | when |
 |-------|------|
-| **down** | Hetzner server not running; Coolify server unreachable; a resource degraded, restarting or unhealthy; a domain that fails its HTTPS check (no connection, certificate error, HTTP 5xx). A stopped resource that has a domain is down, because its site is. |
-| **warn** | starting; a server's 5-minute CPU at or above `CPU_WARN`; an API the monitor could not read; Coolify says stopped but the site still answers |
+| **down** | Hetzner server not running; Coolify server unreachable; a resource degraded, restarting or unhealthy; a domain that fails its HTTPS check (no connection, certificate error, HTTP 5xx); a `PORT_CHECKS` service that doesn't answer, fails TLS or greets wrongly. A stopped resource that has a domain is down, because its site is. |
+| **warn** | a checked TLS certificate close to expiry; starting; a server's 5-minute CPU at or above `CPU_WARN`; an API the monitor could not read; Coolify says stopped but the site still answers |
 | **stopped** | exited and no domain — something you turned off. Grey, not an alert. |
 | **up** | running (healthy, or no health check configured) and its domain answers |
 
@@ -27,6 +27,8 @@ Coolify reports status as `state:health` (`running:healthy`, `running:unknown`,
 | `COOLIFY_INSTANCES` | `NAME=URL,NAME=URL`, e.g. `VAROAPPS-1=http://89.167.57.129:8000,VAROAPPS-2=http://coolify:8080` (an instance's own Coolify is reachable from its apps at `http://coolify:8080` on the `coolify` Docker network) |
 | `COOLIFY_TOKEN_<NAME>` | one API token per instance (upper-case, `-` → `_`), permission **read** |
 | `EXTRA_URLS` | optional `Label=https://…,…` to check as well |
+| `PORT_CHECKS` | optional `Label=host:port,…` TCP services to check, e.g. mail: `Mail SMTP=mail.example.com:25,Mail IMAPS=mail.example.com:993`. 465/993/995 are checked over TLS with the certificate verified; SMTP ports must greet with `220`, IMAP with `* OK`. |
+| `CERT_WARN_DAYS` | warn when a checked TLS certificate expires within this many days (default 14) |
 | `IGNORE` | optional comma list of resource names to leave out |
 | `POLL_SECONDS` | default 60 |
 | `CPU_WARN` | default 90 |
