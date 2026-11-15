@@ -15,6 +15,7 @@ year**: orders, gross income, Etsy fees and postage labels. A single Python file
 | fees    | everything Etsy charged that period per the payment-account ledger: transaction, processing, offsite ads, Etsy Ads, listing/renewal and subscription fees, minus fee refunds and credits |
 | labels  | postage labels bought on Etsy that period (kept separate — the dial has its own checkbox) |
 | net     | gross − fees |
+| toShip  | paid, unshipped, not-canceled orders with at least one physical item: `orders`, `overdue` (ship-by before today), `dueToday`, and the soonest ship-by date |
 
 Periods are the calendar day / month / year in `TZ_NAME` (default America/New_York). Orders count
 by the day they were placed; fees by the day Etsy charged them. Ledger entry types the service

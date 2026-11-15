@@ -116,6 +116,40 @@ def ledger_row(e: dict) -> dict:
             "y": (e.get("ledger_type") or "")}
 
 
+# ------------------------------------------------------------------ to ship
+
+def to_ship_summary(receipts: list, now: datetime) -> dict:
+    """Paid, unshipped, not-canceled orders that contain something physical.
+
+    Etsy gives each transaction an expected_ship_date (the ship-by date). An order's
+    ship-by is the earliest of its physical items. Overdue = ship-by before today,
+    due today = ship-by today, both in the service's time zone.
+    """
+    today = now.date()
+    orders = overdue = due_today = 0
+    soonest = None
+    for r in receipts:
+        if (r.get("status") or "").lower() in EXCLUDED_STATUSES or r.get("is_shipped"):
+            continue
+        physical = [t for t in (r.get("transactions") or []) if not t.get("is_digital")]
+        if not physical:
+            continue
+        orders += 1
+        dates = [t["expected_ship_date"] for t in physical if t.get("expected_ship_date")]
+        if not dates:
+            continue
+        ship_by = datetime.fromtimestamp(min(dates), now.tzinfo).date()
+        if ship_by < today:
+            overdue += 1
+        elif ship_by == today:
+            due_today += 1
+        if soonest is None or ship_by < soonest:
+            soonest = ship_by
+    return {"orders": orders, "overdue": overdue, "dueToday": due_today,
+            "nextShipBy": f"{soonest:%a %b} {soonest.day}" if soonest else None,
+            "nextShipByDate": soonest.isoformat() if soonest else None}
+
+
 # ------------------------------------------------------------------ periods
 
 def period_bounds(now: datetime) -> dict:
@@ -250,7 +284,8 @@ class Store:
         self.tz = tz
         self.lock = threading.Lock()
         self.state = {"receipts": {}, "ledger": {}, "receipts_at": 0, "ledger_at": 0,
-                      "full_at": 0, "year": 0, "last_ok": 0, "last_error": "", "unknown_types": []}
+                      "full_at": 0, "year": 0, "last_ok": 0, "last_error": "", "unknown_types": [],
+                      "to_ship": None}
         try:
             with open(path) as f:
                 self.state.update(json.load(f))
@@ -310,7 +345,13 @@ class Store:
                         s["receipts"][k] = v
                 s["ledger"].update({k: v for k, v in led.items() if v["t"] >= year0})
 
+        # Orders waiting to ship: one small query every sync (paid, not shipped, not canceled).
+        open_orders = list(client.paged(f"/application/shops/{shop_id}/receipts",
+                                        {"was_paid": "true", "was_shipped": "false", "was_canceled": "false"}))
+        to_ship = to_ship_summary(open_orders, now)
+
         with self.lock:
+            s["to_ship"] = to_ship
             s["receipts_at"] = s["ledger_at"] = started
             s["last_ok"] = started
             s["last_error"] = ""
@@ -327,7 +368,8 @@ class Store:
                     "asOf": datetime.fromtimestamp(self.state["last_ok"], self.tz).isoformat() if self.state["last_ok"] else None,
                     "stale": bool(self.state["last_error"]),
                     "error": self.state["last_error"] or None,
-                    "today": periods["today"], "month": periods["month"], "year": periods["year"]}
+                    "today": periods["today"], "month": periods["month"], "year": periods["year"],
+                    "toShip": self.state.get("to_ship")}
 
 
 # ------------------------------------------------------------------ app
