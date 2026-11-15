@@ -128,7 +128,10 @@ def hetzner_servers(token: str, cpu_warn: float) -> list[dict]:
                 series = (((m.json().get("metrics") or {}).get("time_series") or {}).get("cpu") or {}).get("values") or []
                 vals = [float(v[1]) for v in series if len(v) > 1 and v[1] not in (None, "")]
                 if vals:
-                    cpu = round(sum(vals) / len(vals), 1)
+                    # Hetzner sums CPU over all cores (a 4-core box tops out at 400%);
+                    # divide by the core count so 100% means the whole server is busy.
+                    cores = ((s.get("server_type") or {}).get("cores")) or 1
+                    cpu = round(sum(vals) / len(vals) / cores, 1)
             except Exception:
                 cpu = None
         state = "up" if s.get("status") == "running" else "down"
@@ -285,6 +288,9 @@ class Monitor:
             dots.append(state[0].upper())
             if state in ("down", "warn"):
                 problems.append({"name": r["name"], "where": r["server"], "state": state, "why": why})
+        for sv in servers:                 # Hetzner servers get a dot each too
+            counts[sv["state"]] += 1
+            dots.append(sv["state"][0].upper())
         for (n, u) in self.extra:
             ok, why = results[f"extra:{n}"]
             state = "up" if ok else "down"
