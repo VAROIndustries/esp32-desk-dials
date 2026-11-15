@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Desk Dials — round ESP32-S3 AMOLED dials | VARO Industries</title>
+<meta name="description" content="Free firmware and one-click browser installers for the Waveshare ESP32-S3-Touch-AMOLED-1.75 round display: a sales dial for FairKeep and Etsy, a live flight tracker, and more.">
+<style>
+  :root { --bg:#0b1424; --card:#131f35; --line:#1e2a40; --cream:#f4ebdd; --dim:#8a93a6; --gold:#f2a93b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--cream); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 48px 22px 64px; }
+  h1 { font-size: 40px; margin: 0; letter-spacing: -.5px; }
+  h1 span { color: var(--gold); }
+  .lead { color: var(--dim); margin: 8px 0 34px; font-size: 18px; max-width: 680px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 18px; }
+  .dial { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 22px; display: flex; flex-direction: column; }
+  .dial .faces { display: flex; gap: 10px; margin: 0 0 16px; }
+  .dial .faces img { width: 50%; max-width: 130px; border-radius: 50%; box-shadow: 0 0 0 5px #050a14; }
+  .dial .ring { width: 130px; height: 130px; border-radius: 50%; border: 3px solid var(--line); display: grid; place-items: center;
+                color: var(--gold); font-size: 44px; margin: 0 0 16px; background: radial-gradient(circle, #10213d 0%, #050a14 70%); }
+  .dial h2 { margin: 0 0 4px; font-size: 21px; }
+  .tag { display: inline-block; font-size: 12px; color: var(--dim); border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; margin: 0 6px 10px 0; }
+  .dial p { margin: 0 0 14px; color: #cfd5e0; }
+  .dial ul { margin: 0 0 18px; padding-left: 20px; color: #cfd5e0; } .dial li { margin: 3px 0; }
+  .btn { margin-top: auto; display: inline-block; text-align: center; background: var(--gold); color: #0b1424; font-weight: 700; border-radius: 10px;
+         padding: 11px 16px; text-decoration: none; }
+  .btn.ext { background: #1e2a40; color: var(--cream); }
+  .credit { color: var(--dim); font-size: 13px; margin-top: 10px; }
+  .soon { border-style: dashed; justify-content: center; color: var(--dim); }
+  h3 { color: var(--gold); margin: 46px 0 10px; font-size: 18px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; }
+  .card ol { margin: 0; padding-left: 22px; } .card li { margin: 6px 0; }
+  a { color: var(--gold); }
+  code { background: #0b1424; border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; color: var(--gold); }
+  footer { color: var(--dim); font-size: 13px; margin-top: 46px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Desk <span>Dials</span></h1>
+  <p class="lead">Free firmware for the <b>Waveshare ESP32-S3-Touch-AMOLED-1.75</b> &mdash; the round 1.75&Prime; touch AMOLED.
+    Pick a dial, plug the board into your computer, and install it from this page in Chrome or Edge. No toolchain, and you set up WiFi from your phone.</p>
+
+  <div class="grid">
+    <div class="dial">
+      <div class="faces"><img src="sales/img/total.png" alt="Sales Dial showing today's FairKeep total"><img src="sales/img/etsy.png" alt="Sales Dial showing an Etsy month"></div>
+      <h2>Sales Dial</h2>
+      <div><span class="tag">FairKeep</span><span class="tag">Etsy</span></div>
+      <p>Your takings, live on your desk.</p>
+      <ul>
+        <li><b>FairKeep:</b> today's sales across your shows and web orders &mdash; total, POS, web, or all three.</li>
+        <li><b>Etsy:</b> today, this month and this year &mdash; orders and gross, or after Etsy fees.</li>
+        <li>Tap to change view, or lock each dial to one.</li>
+      </ul>
+      <a class="btn" href="sales/">Install the Sales Dial</a>
+    </div>
+
+    <div class="dial">
+      <div class="ring" aria-hidden="true">&#9992;</div>
+      <h2>Flight Tracker</h2>
+      <div><span class="tag">ADS-B</span><span class="tag">community</span></div>
+      <p>Live aircraft around you on a radar scope: callsign, altitude, speed, heading and route, with swipeable radar, list and stats views.</p>
+      <a class="btn ext" href="https://socquique.github.io/capsule-radar/" rel="noopener">Install Capsule Radar &#8599;</a>
+      <p class="credit">By Quique Tortosa &mdash; <a href="https://github.com/socquique/capsule-radar" rel="noopener">github.com/socquique/capsule-radar</a> (MIT). Our dials build on its display and touch drivers.</p>
+    </div>
+
+    <div class="dial soon">
+      <h2 style="color:var(--dim)">More dials coming</h2>
+      <p>Ideas or requests? Open an issue on <a href="https://github.com/VAROIndustries/esp32-desk-dials/issues">GitHub</a>.</p>
+    </div>
+  </div>
+
+  <h3>The hardware</h3>
+  <div class="card">
+    <p style="margin-top:0">Every dial here runs on the Waveshare <b>ESP32-S3-Touch-AMOLED-1.75</b>: 466&times;466 round AMOLED, capacitive touch, 8&nbsp;MB PSRAM, USB-C, with an optional battery.
+      You need a USB-C cable that carries data (not a charge-only cable).</p>
+    <ol>
+      <li><b>Board not showing up in the installer?</b> Unplug it, hold <b>BOOT</b>, plug it back in, then let go. If a battery is fitted, hold <b>PWR</b> to switch it off first.</li>
+      <li>After installing, unplug and replug it (or tap PWR) so it starts the new firmware.</li>
+      <li>You can switch a board between dials any time &mdash; just install a different one.</li>
+    </ol>
+  </div>
+
+  <footer>
+    Open source (MIT): <a href="https://github.com/VAROIndustries/esp32-desk-dials">github.com/VAROIndustries/esp32-desk-dials</a> &middot;
+    Made by <a href="https://varo.industries">VARO Industries</a> &middot; <a href="https://fairkeep.app">FairKeep</a><br>
+    The term 'Etsy' is a trademark of Etsy, Inc. This application uses the Etsy API but is not endorsed or certified by Etsy, Inc.
+    Waveshare is a trademark of its owner; these projects are not affiliated with Waveshare.
+  </footer>
+</main>
+</body>
+</html>

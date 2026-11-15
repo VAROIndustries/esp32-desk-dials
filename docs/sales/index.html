@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sales Dial — install | VARO Desk Dials</title>
+<meta name="description" content="Browser installer for round ESP32-S3 AMOLED desk dials (Waveshare ESP32-S3-Touch-AMOLED-1.75): today's FairKeep sales or Etsy shop totals on your desk.">
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+  :root { --bg:#0b1424; --card:#131f35; --line:#1e2a40; --cream:#f4ebdd; --dim:#8a93a6; --gold:#f2a93b; --green:#4ade80; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--cream); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width: 780px; margin: 0 auto; padding: 40px 22px 60px; }
+  h1 { font-size: 34px; margin: 0; letter-spacing: -.5px; }
+  h1 span { color: var(--gold); }
+  .lead { color: var(--dim); margin: 6px 0 28px; }
+  .shots { display:flex; gap:14px; flex-wrap:wrap; margin: 0 0 30px; }
+  .shots figure { margin:0; text-align:center; flex: 1 1 150px; }
+  .shots img { width: 100%; max-width: 170px; border-radius: 50%; box-shadow: 0 0 0 6px #050a14; }
+  .shots figcaption { color: var(--dim); font-size: 13px; margin-top: 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 24px; margin: 0 0 18px; }
+  h2 { font-size: 18px; margin: 0 0 12px; color: var(--gold); }
+  ol { margin: 0; padding-left: 22px; } li { margin: 6px 0; }
+  code { background: #0b1424; border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; color: var(--gold); }
+  .install { text-align:center; padding: 28px 24px; }
+  esp-web-install-button { --esp-tools-button-color: #0b1424; --esp-tools-button-background-color: var(--gold); --esp-tools-button-border-radius: 10px; }
+  .muted { color: var(--dim); font-size: 14px; }
+  .warn { color: #f87171; }
+</style>
+</head>
+<body>
+<main>
+  <p style="margin:0 0 10px"><a href="../" style="color:var(--dim);text-decoration:none;font-size:14px">&larr; All desk dials</a></p>
+  <h1>Sales <span>Dial</span></h1>
+  <p class="lead">Today's FairKeep takings &mdash; POS, web orders, or both &mdash; or your Etsy shop's day, month and year, on a round desk display. For the Waveshare ESP32-S3-Touch-AMOLED-1.75.</p>
+
+  <div class="shots">
+    <figure><img src="img/total.png" alt="Total view"><figcaption>Total</figcaption></figure>
+    <figure><img src="img/pos.png" alt="POS view"><figcaption>POS only</figcaption></figure>
+    <figure><img src="img/web.png" alt="Web view"><figcaption>Web only</figcaption></figure>
+    <figure><img src="img/all.png" alt="All three view"><figcaption>All three</figcaption></figure>
+    <figure><img src="img/etsy.png" alt="Etsy month view"><figcaption>Etsy &middot; month</figcaption></figure>
+  </div>
+
+  <div class="card">
+    <h2>1. Get a key</h2>
+    <p class="muted"><b>For FairKeep sales:</b></p>
+    <ol>
+      <li>In FairKeep, open <b>Settings &rarr; API Keys</b> and create a key named something like <i>Desk dial</i>.</li>
+      <li>Tick <b>Reports read</b>. Nothing else is needed.</li>
+      <li>Copy the key (it starts with <code>bb_live_</code>) &mdash; FairKeep only shows it once.</li>
+    </ol>
+    <p class="muted" style="margin-top:14px"><b>For Etsy:</b> the dial reads an Etsy dial service (the <code>etsy-service</code> folder in the repo), which holds the shop's Etsy authorization. Use that service's key; the dial switches to Etsy automatically when the key doesn't start with <code>bb_live_</code>, and you can set the service's address on the dial's settings page.</p>
+  </div>
+
+  <div class="card install">
+    <h2>2. Install the firmware</h2>
+    <p class="muted">Plug the board into this computer with a USB-C <b>data</b> cable, then:</p>
+    <esp-web-install-button manifest="manifest.json">
+      <span slot="unsupported" class="warn">This browser can't talk to USB devices. Use Chrome or Edge on a desktop computer.</span>
+      <span slot="not-allowed" class="warn">The installer needs a secure page (https or localhost).</span>
+    </esp-web-install-button>
+    <p class="muted" style="margin-top:18px">Pick the <code>USB JTAG/serial debug unit</code> port and choose <b>Erase device</b> on the first install.</p>
+    <p class="muted"><b>Board not in the list?</b> Unplug it, hold <b>BOOT</b>, plug it back in, then let go and try again (if a battery is fitted, hold <b>PWR</b> to switch it off first).
+      After installing, unplug and replug it (or tap PWR) so it starts normally.</p>
+  </div>
+
+  <div class="card">
+    <h2>3. Connect it</h2>
+    <ol>
+      <li>The dial shows <b>Set up WiFi</b>. On your phone, join the <code>FairKeepDial-Setup</code> WiFi network &mdash; the setup page opens by itself (or go to <code>http://192.168.4.1</code>). If your phone warns that the network has no internet, choose to stay connected.</li>
+      <li>Pick your WiFi, enter its password, paste your key, and save. The dial restarts and starts showing today's sales.</li>
+      <li>Change the view, cents, refresh rate or brightness any time at the address shown on the setup page, or <code>http://fairkeepdial.local/</code> from a computer.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>Using it</h2>
+    <ol>
+      <li><b>Tap</b> the screen to switch views: FairKeep cycles Total &rarr; POS &rarr; Web &rarr; All three; Etsy cycles Today &rarr; Month &rarr; Year. Untick &ldquo;Tap the dial to change view&rdquo; on the settings page to lock a dial to one view.</li>
+      <li><b>Press and hold</b> to refresh right away. Otherwise it refreshes every minute.</li>
+      <li>FairKeep numbers match the Live View: every show on today's calendar plus Shopify web orders, using your POS sales basis from Settings.</li>
+      <li>Etsy shows gross by default (items + shipping after discounts and refunds, without the sales tax Etsy collects). Tick &ldquo;Show after Etsy fees&rdquo; to subtract everything Etsy charged that period, and optionally postage labels too.</li>
+    </ol>
+  </div>
+
+  <p class="muted">Open source (MIT) at <a style="color:var(--gold)" href="https://github.com/VAROIndustries/esp32-desk-dials">github.com/VAROIndustries/esp32-desk-dials</a> &mdash; firmware, Etsy service and this page. Made by <a style="color:var(--gold)" href="https://varo.industries">VARO Industries</a>.
+     Display, touch and power drivers adapted from <a style="color:var(--gold)" href="https://github.com/socquique/capsule-radar">Capsule Radar</a> (MIT).</p>
+  <p class="muted" style="font-size:12px">The term 'Etsy' is a trademark of Etsy, Inc. This application uses the Etsy API but is not endorsed or certified by Etsy, Inc. FairKeep is a product of VARO Industries.</p>
+</main>
+</body>
+</html>

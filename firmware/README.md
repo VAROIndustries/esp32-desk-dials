@@ -1,0 +1,52 @@
+# Desk dial firmware
+
+PlatformIO / Arduino (pioarduino platform, LVGL 8.4) for the Waveshare
+ESP32-S3-Touch-AMOLED-1.75.
+
+## Data sources
+
+**FairKeep** — `GET https://api.fairkeep.app/api/v1/device/today` with a FairKeep API key
+(`Authorization: Bearer bb_live_…`, scope *Reports read*). Returns today's takings: the FairKeep Live
+View reduced to three numbers.
+
+```json
+{ "date": "2026-11-14", "salesBasis": "gross",
+  "total": { "revenue": 2203.19, "orders": 72 },
+  "pos":   { "revenue": 1886.49, "orders": 66, "shows": 2 },
+  "web":   { "revenue": 316.70,  "orders": 6,  "note": null },
+  "otherIncome": 0 }
+```
+
+**Etsy** — `GET <service>/summary` from an [Etsy dial service](../etsy-service/):
+
+```json
+{ "today": { "label": "Sat Nov 14", "orders": 4,   "gross": 67.09,    "fees": 32.87,   "labels": 0,       "net": 34.22 },
+  "month": { "label": "November",   "orders": 44,  "gross": 1607.60,  "fees": 594.64,  "labels": 264.99,  "net": 1012.96 },
+  "year":  { "label": "2026",       "orders": 473, "gross": 17613.58, "fees": 7217.61, "labels": 2873.60, "net": 10395.97 } }
+```
+
+The setup hotspot takes either key: one starting `bb_live_` selects FairKeep, anything else Etsy.
+
+## Settings page (`http://fairkeepdial.local/` or the dial's IP)
+
+Data source, keys and URLs per source, view, *Tap the dial to change view* (untick to lock it),
+show cents, *after Etsy fees* / *after postage labels*, refresh interval, brightness, firmware upload,
+WiFi reset. Saved keys are never shown back, only their prefix; cross-site form posts are refused.
+
+## Build
+
+```
+pio run                          # build
+pio run -t upload                # flash over USB (hold BOOT while plugging in if no port shows)
+python tools/make_release.py     # refresh ../docs: merged image at 0x0, OTA image, manifest
+tools/make_fonts.sh              # regenerate the big-digit fonts (needs Node)
+```
+
+Bump `FW_VERSION` in `src/config.h` for each release.
+
+## Notes
+
+- HTTPS is verified against the root CAs in `src/certs.h` (Let's Encrypt, Google Trust Services,
+  DigiCert, Sectigo/USERTrust, Amazon, SSL.com, Microsoft). Add a root there if your API host uses
+  another CA.
+- The settings page is unauthenticated on your LAN, like most hobby devices.

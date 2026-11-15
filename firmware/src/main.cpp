@@ -1,0 +1,679 @@
+// FairKeep Dial — sales on a round desk display.
+//
+// Two data sources:
+//   FairKeep  GET {fkBase}/device/today   (bb_live_ API key, Reports read)
+//             views: Total / POS / Web / All three
+//   Etsy      GET {etBase}/summary        (Etsy dial service key, see etsy-service/)
+//             views: Today / Month / Year; gross by default, optionally after Etsy fees
+//             (and optionally after postage labels too)
+// Setup: first boot opens the FairKeepDial-Setup hotspot (WiFi + key). Afterwards
+// everything is on http://fairkeepdial.local/ (or the dial's IP).
+// Touch: tap = next view (unless the view is locked), long-press = refresh now.
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <NetworkClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Update.h>
+
+#include "config.h"
+#include "certs.h"
+#include "display.h"
+#include "battery.h"
+#include "ui.h"
+
+enum Source : uint8_t { SRC_FAIRKEEP = 0, SRC_ETSY = 1 };
+enum FkMode : uint8_t { FK_TOTAL = 0, FK_POS, FK_WEB, FK_ALL, FK_COUNT };
+enum EtMode : uint8_t { ET_TODAY = 0, ET_MONTH, ET_YEAR, ET_COUNT };
+
+// ------------------------------------------------------------------ settings
+struct Settings {
+    uint8_t  src = SRC_FAIRKEEP;
+    String   fkKey, fkBase = DEFAULT_API_BASE;
+    uint8_t  fkMode = FK_TOTAL;
+    String   etKey, etBase = DEFAULT_ETSY_BASE;
+    uint8_t  etMode = ET_TODAY;
+    bool     etNet = false;      // show after Etsy fees instead of gross
+    bool     etLabels = false;   // ...and after postage labels too
+    bool     tapCycles = true;   // false = view locked to the one picked on the settings page
+    uint16_t pollS = DEFAULT_POLL_S;
+    bool     cents = false;
+    uint8_t  bright = DEFAULT_BRIGHTNESS;
+
+    const String &key() const  { return src == SRC_ETSY ? etKey : fkKey; }
+    const String &base() const { return src == SRC_ETSY ? etBase : fkBase; }
+};
+static Settings    g_set;
+static Preferences g_prefs;
+
+// NVS keys "apikey", "apibase", "mode" are the FairKeep ones from v1.0 — kept so a
+// dial updated over the air keeps its setup.
+static void loadSettings() {
+    g_prefs.begin("fkdial", true);
+    g_set.src      = g_prefs.getUChar("src", SRC_FAIRKEEP) > SRC_ETSY ? SRC_FAIRKEEP : g_prefs.getUChar("src", SRC_FAIRKEEP);
+    g_set.fkKey    = g_prefs.getString("apikey", "");
+    g_set.fkBase   = g_prefs.getString("apibase", DEFAULT_API_BASE);
+    g_set.fkMode   = g_prefs.getUChar("mode", FK_TOTAL) % FK_COUNT;
+    g_set.etKey    = g_prefs.getString("etkey", "");
+    g_set.etBase   = g_prefs.getString("etbase", DEFAULT_ETSY_BASE);
+    g_set.etMode   = g_prefs.getUChar("etmode", ET_TODAY) % ET_COUNT;
+    g_set.etNet    = g_prefs.getBool("etnet", false);
+    g_set.etLabels = g_prefs.getBool("etlbl", false);
+    g_set.tapCycles = g_prefs.getBool("tap", true);
+    g_set.pollS    = constrain(g_prefs.getUShort("poll", DEFAULT_POLL_S), MIN_POLL_S, MAX_POLL_S);
+    g_set.cents    = g_prefs.getBool("cents", false);
+    g_set.bright   = constrain(g_prefs.getUChar("bright", DEFAULT_BRIGHTNESS), 10, 255);
+    g_prefs.end();
+}
+
+static void saveSettings() {
+    g_prefs.begin("fkdial", false);
+    g_prefs.putUChar("src", g_set.src);
+    g_prefs.putString("apikey", g_set.fkKey);
+    g_prefs.putString("apibase", g_set.fkBase);
+    g_prefs.putUChar("mode", g_set.fkMode);
+    g_prefs.putString("etkey", g_set.etKey);
+    g_prefs.putString("etbase", g_set.etBase);
+    g_prefs.putUChar("etmode", g_set.etMode);
+    g_prefs.putBool("etnet", g_set.etNet);
+    g_prefs.putBool("etlbl", g_set.etLabels);
+    g_prefs.putBool("tap", g_set.tapCycles);
+    g_prefs.putUShort("poll", g_set.pollS);
+    g_prefs.putBool("cents", g_set.cents);
+    g_prefs.putUChar("bright", g_set.bright);
+    g_prefs.end();
+}
+
+// ------------------------------------------------------------------ fetched data
+struct FkData {
+    bool  have = false;
+    float total = 0, pos = 0, web = 0;
+    int   totalOrders = 0, posOrders = 0, webOrders = 0, shows = 0;
+    char  webNote[96] = "";
+};
+struct EtPeriod {
+    char  label[16] = "";
+    int   orders = 0;
+    float gross = 0, fees = 0, labels = 0;
+};
+struct EtData {
+    bool     have = false;
+    EtPeriod p[ET_COUNT];
+};
+
+// Written by the fetch task (core 0), read by the UI loop (core 1).
+static SemaphoreHandle_t g_lock;
+static FkData            g_fk;
+static EtData            g_et;
+static bool              g_dirty = true;
+static String            g_err;            // last error, "" = last fetch ok
+static String            g_warn;           // non-fatal note from the server (e.g. Etsy sync delayed)
+static uint32_t          g_lastOkMs = 0;
+static uint8_t           g_dataSrc = 0xFF; // which source g_fk/g_et/g_lastOkMs belong to
+static volatile bool     g_fetchNow = true;
+
+static String keyPrefix(const String &k) {
+    return k.length() > 12 ? k.substring(0, 12) + "..." : (k.length() ? String("(set)") : String(""));
+}
+
+static void setError(const String &e) {
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_err = e;
+    g_dirty = true;
+    xSemaphoreGive(g_lock);
+}
+
+// Forget what we showed for the other source.
+static void resetData() {
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_fk = FkData();
+    g_et = EtData();
+    g_err = "";
+    g_warn = "";
+    g_lastOkMs = 0;
+    g_dataSrc = g_set.src;
+    g_dirty = true;
+    xSemaphoreGive(g_lock);
+}
+
+static void doFetch() {
+    String key, base;
+    uint8_t src;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    src = g_set.src;
+    key = g_set.key();
+    base = g_set.base();
+    xSemaphoreGive(g_lock);
+    if (key.isEmpty() || WiFi.status() != WL_CONNECTED) return;
+
+    while (base.endsWith("/")) base.remove(base.length() - 1);
+    const String url = base + (src == SRC_ETSY ? "/summary" : "/device/today");
+    const char *who = src == SRC_ETSY ? "the Etsy dial service" : "FairKeep";
+
+    NetworkClientSecure client;
+    client.setCACert(ROOT_CAS);
+    HTTPClient http;
+    http.setTimeout(15000);
+    http.setConnectTimeout(10000);
+    if (!http.begin(client, url)) { setError("Bad API URL"); return; }
+    http.addHeader("Authorization", "Bearer " + key);
+    http.addHeader("Accept", "application/json");
+    http.setUserAgent(FW_NAME "/" FW_VERSION);
+
+    const int code = http.GET();
+    String body = code > 0 ? http.getString() : String();
+    http.end();
+
+    if (code <= 0) {
+        Serial.printf("[fetch] %s -> %d (%s)\n", url.c_str(), code, HTTPClient::errorToString(code).c_str());
+        setError(String("Can't reach ") + who);
+        return;
+    }
+
+    JsonDocument doc;
+    const DeserializationError jerr = deserializeJson(doc, body);
+    if (code != 200) {
+        String msg = (!jerr && doc["error"].is<const char *>()) ? String((const char *)doc["error"]) : String();
+        Serial.printf("[fetch] HTTP %d %s\n", code, msg.c_str());
+        if (code == 401)      setError("Key rejected - update it on the setup page");
+        else if (code == 404) setError(src == SRC_ETSY ? "Etsy dial service not found - check the URL"
+                                                       : "FairKeep doesn't have the dial endpoint yet");
+        else if (code == 429) setError("Too many requests - slow the refresh down");
+        else if (msg.length()) setError(msg);
+        else                  setError(String(who) + " error " + String(code));
+        return;
+    }
+    if (jerr) { setError(String("Unreadable reply from ") + who); return; }
+
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (src != g_set.src) { xSemaphoreGive(g_lock); return; }   // source changed mid-fetch
+    if (src == SRC_ETSY) {
+        static const char *names[ET_COUNT] = { "today", "month", "year" };
+        EtData e;
+        e.have = true;
+        for (int i = 0; i < ET_COUNT; ++i) {
+            JsonObject o = doc[names[i]];
+            strlcpy(e.p[i].label, o["label"] | "", sizeof(e.p[i].label));
+            e.p[i].orders = o["orders"] | 0;
+            e.p[i].gross  = o["gross"] | 0.0f;
+            e.p[i].fees   = o["fees"] | 0.0f;
+            e.p[i].labels = o["labels"] | 0.0f;
+        }
+        g_et = e;
+        g_warn = doc["stale"] | false ? String("Etsy sync delayed - showing last numbers") : String();
+    } else {
+        FkData s;
+        s.have        = true;
+        s.total       = doc["total"]["revenue"] | 0.0f;
+        s.totalOrders = doc["total"]["orders"] | 0;
+        s.pos         = doc["pos"]["revenue"] | 0.0f;
+        s.posOrders   = doc["pos"]["orders"] | 0;
+        s.shows       = doc["pos"]["shows"] | 0;
+        s.web         = doc["web"]["revenue"] | 0.0f;
+        s.webOrders   = doc["web"]["orders"] | 0;
+        strlcpy(s.webNote, doc["web"]["note"] | "", sizeof(s.webNote));
+        g_fk = s;
+        g_warn = "";
+    }
+    g_dataSrc = src;
+    g_err = "";
+    g_lastOkMs = millis();
+    g_dirty = true;
+    xSemaphoreGive(g_lock);
+    Serial.printf("[fetch] ok (%s)\n", src == SRC_ETSY ? "etsy" : "fairkeep");
+}
+
+static void fetchTask(void *) {
+    uint32_t last = 0;
+    for (;;) {
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        const uint32_t period = (uint32_t)g_set.pollS * 1000UL;
+        const bool     hasKey = !g_set.key().isEmpty();
+        xSemaphoreGive(g_lock);
+        if (g_fetchNow || (last == 0) || (millis() - last >= period)) {
+            if (WiFi.status() == WL_CONNECTED && hasKey) {
+                g_fetchNow = false;
+                doFetch();
+                last = millis();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
+// ------------------------------------------------------------------ view building
+static void ordersText(char *out, size_t n, int orders) {
+    snprintf(out, n, "%d order%s", orders, orders == 1 ? "" : "s");
+}
+
+static void upper(char *s) { for (; *s; ++s) *s = (char)toupper((unsigned char)*s); }
+
+// Build the screen from the data + settings. Caller holds g_lock.
+static ViewData buildView() {
+    ViewData v;
+    if (g_set.src == SRC_ETSY) {
+        const EtPeriod &p = g_et.p[g_set.etMode];
+        static const char *fallback[ET_COUNT] = { "TODAY", "THIS MONTH", "THIS YEAR" };
+        char lbl[24];
+        // "Today" reads better than the date the service sends for the day view.
+        snprintf(lbl, sizeof(lbl), "%s", g_set.etMode == ET_TODAY || !p.label[0] ? fallback[g_set.etMode] : p.label);
+        upper(lbl);
+        snprintf(v.header, sizeof(v.header), "ETSY  -  %s", lbl);
+        v.have = g_et.have;
+        float amount = p.gross;
+        if (g_set.etNet) amount -= p.fees + (g_set.etLabels ? p.labels : 0);
+        v.big = amount;
+        char o[24];
+        ordersText(o, sizeof(o), p.orders);
+        if (g_set.etNet) snprintf(v.sub, sizeof(v.sub), "%s  -  %s", o, g_set.etLabels ? "after fees + labels" : "after fees");
+        else             snprintf(v.sub, sizeof(v.sub), "%s", o);
+        return v;
+    }
+
+    const FkData &s = g_fk;
+    v.have = s.have;
+    int orders = s.totalOrders;
+    v.big = s.total;
+    switch (g_set.fkMode) {
+        case FK_POS:
+            if (s.shows > 0) snprintf(v.header, sizeof(v.header), "POS  -  %d SHOW%s", s.shows, s.shows == 1 ? "" : "S");
+            else             snprintf(v.header, sizeof(v.header), "POS  -  NO SHOWS TODAY");
+            v.big = s.pos; orders = s.posOrders; break;
+        case FK_WEB:
+            snprintf(v.header, sizeof(v.header), "WEB ORDERS");
+            v.big = s.web; orders = s.webOrders; break;
+        default:
+            snprintf(v.header, sizeof(v.header), "TODAY'S SALES");
+            break;
+    }
+    if (!s.have) snprintf(v.header, sizeof(v.header), "TODAY");
+    if (g_set.fkMode == FK_ALL) {
+        v.twoCol = true;
+        strlcpy(v.colHdr[0], "POS", sizeof(v.colHdr[0]));
+        strlcpy(v.colHdr[1], "WEB", sizeof(v.colHdr[1]));
+        v.colVal[0] = s.pos;
+        v.colVal[1] = s.web;
+        ordersText(v.colSub[0], sizeof(v.colSub[0]), s.posOrders);
+        ordersText(v.colSub[1], sizeof(v.colSub[1]), s.webOrders);
+    } else if (g_set.fkMode == FK_WEB && s.webNote[0] && s.web == 0) {
+        strlcpy(v.sub, s.webNote, sizeof(v.sub));
+    } else {
+        ordersText(v.sub, sizeof(v.sub), orders);
+    }
+    return v;
+}
+
+static void renderView() {
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    ViewData v = buildView();
+    const int count = g_set.tapCycles ? (g_set.src == SRC_ETSY ? (int)ET_COUNT : (int)FK_COUNT) : 0;
+    const int active = g_set.src == SRC_ETSY ? g_set.etMode : g_set.fkMode;
+    xSemaphoreGive(g_lock);
+    ui_set_dots(count, active);
+    ui_set_view(v);
+}
+
+// ------------------------------------------------------------------ wifi + setup portal
+static WiFiManager          g_wm;
+static WiFiManagerParameter g_wmKey("apikey", "FairKeep API key (bb_live_...) or Etsy dial key", "", 80);
+static bool                 g_portalSaved = false;
+static bool                 g_netUp = false;
+
+// A key from the setup hotspot: FairKeep keys start with bb_live_, anything else is an
+// Etsy dial service key.
+static void applyKey(String k) {
+    k.trim();
+    if (!k.length()) return;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (k.startsWith("bb_live_")) { g_set.fkKey = k; g_set.src = SRC_FAIRKEEP; }
+    else                          { g_set.etKey = k; g_set.src = SRC_ETSY; }
+    xSemaphoreGive(g_lock);
+}
+
+// ------------------------------------------------------------------ config web page
+static WebServer g_web(80);
+
+// A page on another site can make your browser POST to this device; refuse anything
+// whose Origin doesn't match the address the browser used to reach us.
+static bool crossSite() {
+    const String origin = g_web.header("Origin");
+    if (!origin.length()) return false;
+    String auth = origin.substring(origin.indexOf("://") + 3);
+    return !auth.equalsIgnoreCase(g_web.hostHeader());
+}
+
+static String htmlEscape(const String &s) {
+    String o;
+    for (char c : s) {
+        if (c == '<') o += "&lt;"; else if (c == '>') o += "&gt;";
+        else if (c == '&') o += "&amp;"; else if (c == '"') o += "&quot;";
+        else if (c == '\'') o += "&#39;"; else o += c;
+    }
+    return o;
+}
+
+static const char PAGE_HEAD[] PROGMEM =
+    "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>FairKeep Dial</title><style>"
+    "body{font-family:system-ui,sans-serif;background:#0b1424;color:#f4ebdd;margin:0;padding:24px;max-width:560px}"
+    "h1{color:#f2a93b;font-size:22px;margin:0 0 4px}h2{color:#f2a93b;font-size:16px;margin:0 0 4px}.sub{color:#8a93a6;font-size:13px;margin:0 0 20px}"
+    ".card{background:#131f35;border:1px solid #1e2a40;border-radius:12px;padding:16px;margin:0 0 16px}"
+    "label{display:block;font-size:13px;color:#8a93a6;margin:12px 0 4px}label.c{color:#f4ebdd;font-size:15px}"
+    "input,select{width:100%;box-sizing:border-box;padding:9px;border-radius:8px;border:1px solid #2a3a58;background:#0b1424;color:#f4ebdd;font-size:15px}"
+    "input[type=checkbox]{width:auto;margin-right:8px}input[type=range]{padding:0}"
+    "button{background:#f2a93b;color:#0b1424;border:0;border-radius:8px;padding:10px 16px;font-weight:600;font-size:15px;margin-top:16px;cursor:pointer}"
+    "button.sec{background:#1e2a40;color:#f4ebdd}.ok{color:#4ade80}.err{color:#f87171}code{color:#f2a93b}"
+    "</style></head><body>";
+
+static String keyField(const char *name, const String &cur, const char *placeholder) {
+    String p = "<input name=";
+    p += name;
+    p += " autocomplete=off placeholder='";
+    p += cur.isEmpty() ? String(placeholder) : htmlEscape("Saved: " + keyPrefix(cur) + "  (leave blank to keep)");
+    p += "'>";
+    return p;
+}
+
+static String options(const char *const *names, int n, int sel) {
+    String p;
+    for (int i = 0; i < n; ++i)
+        p += "<option value=" + String(i) + (sel == i ? " selected>" : ">") + names[i] + "</option>";
+    return p;
+}
+
+static String checkbox(const char *name, bool on, const char *text) {
+    return String("<label class=c><input type=checkbox name=") + name + " value=1" + (on ? " checked" : "") + ">" + text + "</label>";
+}
+
+static void handleRoot() {
+    String err, warn; uint32_t lastOk;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    err = g_err; warn = g_warn; lastOk = g_lastOkMs;
+    const Settings s = g_set;
+    xSemaphoreGive(g_lock);
+
+    String status;
+    if (s.key().isEmpty())     status = "<span class=err>No key for this data source yet</span>";
+    else if (err.length())     status = "<span class=err>" + htmlEscape(err) + "</span>";
+    else if (lastOk)           status = "<span class=ok>Connected</span> &middot; updated " + String((millis() - lastOk) / 1000) + "s ago";
+    else                       status = "Waiting for first update&hellip;";
+    if (warn.length()) status += "<br><span class=err>" + htmlEscape(warn) + "</span>";
+
+    static const char *srcNames[] = { "FairKeep (today's POS + web sales)", "Etsy (via an Etsy dial service)" };
+    static const char *fkNames[FK_COUNT] = { "Total (POS + web)", "POS only", "Web only", "All three" };
+    static const char *etNames[ET_COUNT] = { "Today", "This month", "This year" };
+
+    String p = FPSTR(PAGE_HEAD);
+    p += "<h1>FairKeep Dial</h1><p class=sub>" FW_VERSION " &middot; " + WiFi.localIP().toString() + " &middot; " + htmlEscape(WiFi.SSID()) + "</p>";
+    p += "<div class=card>" + status + "</div>";
+    p += "<form method=POST action=/save>";
+
+    p += "<div class=card><label>Show</label><select name=src>" + options(srcNames, 2, s.src) + "</select>";
+    p += checkbox("tap", s.tapCycles, "Tap the dial to change view (untick to lock it to the view below)");
+    p += checkbox("cents", s.cents, "Show cents") + "</div>";
+
+    p += "<div class=card><h2>FairKeep</h2>";
+    p += "<label>API key</label>" + keyField("fkkey", s.fkKey, "bb_live_...");
+    p += "<p class=sub style='margin:6px 0 0'>FairKeep &rarr; Settings &rarr; API Keys. Tick <b>Reports read</b>.</p>";
+    p += "<label>View</label><select name=fkmode>" + options(fkNames, FK_COUNT, s.fkMode) + "</select>";
+    p += "<label>API URL</label><input name=fkbase value='" + htmlEscape(s.fkBase) + "'></div>";
+
+    p += "<div class=card><h2>Etsy</h2>";
+    p += "<label>Dial service key</label>" + keyField("etkey", s.etKey, "the SERVICE_KEY of the Etsy dial service");
+    p += "<label>View</label><select name=etmode>" + options(etNames, ET_COUNT, s.etMode) + "</select>";
+    p += checkbox("etnet", s.etNet, "Show after Etsy fees (default: gross)");
+    p += checkbox("etlbl", s.etLabels, "...and after postage labels too");
+    p += "<p class=sub style='margin:6px 0 0'>Gross = items + shipping after discounts and refunds; sales tax Etsy collects is left out. "
+         "Fees = everything Etsy charged that period: transaction, processing, ads, listing and subscription fees.</p>"
+         "<p class=sub style='margin:10px 0 0;font-size:11px'>The term 'Etsy' is a trademark of Etsy, Inc. This application uses the Etsy API but is not endorsed or certified by Etsy, Inc.</p>";
+    p += "<label>Service URL</label><input name=etbase value='" + htmlEscape(s.etBase) + "'></div>";
+
+    p += "<div class=card><label>Refresh every (seconds, " + String(MIN_POLL_S) + "&ndash;" + String(MAX_POLL_S) + ")</label>";
+    p += "<input type=number name=poll min=" + String(MIN_POLL_S) + " max=" + String(MAX_POLL_S) + " value=" + String(s.pollS) + ">";
+    p += "<label>Brightness</label><input type=range name=bright min=10 max=255 value=" + String(s.bright) + ">";
+    p += "<button>Save</button></div></form>";
+
+    p += "<form method=POST action=/refresh><button class=sec>Refresh now</button></form>";
+    p += "<div class=card style='margin-top:16px'><b>Firmware update</b>"
+         "<form method=POST action=/update enctype=multipart/form-data>"
+         "<input type=file name=fw accept=.bin style='margin-top:10px'><button class=sec>Upload .bin</button></form></div>";
+    p += "<form method=POST action=/wifi onsubmit=\"return confirm('Forget WiFi and reopen the setup hotspot?')\">"
+         "<button class=sec>Reset WiFi</button></form>";
+    p += "<p class=sub>On the dial: tap to change view, press and hold to refresh.</p></body></html>";
+    g_web.send(200, "text/html", p);
+}
+
+static void sendBack(const char *msg) {
+    String p = FPSTR(PAGE_HEAD);
+    p += "<h1>FairKeep Dial</h1><div class=card>";
+    p += msg;
+    p += "</div><p><a style='color:#f2a93b' href='/'>Back</a></p><script>setTimeout(()=>location='/',1500)</script></body></html>";
+    g_web.send(200, "text/html", p);
+}
+
+static void handleSave() {
+    if (crossSite()) { g_web.send(403, "text/plain", "cross-site request rejected"); return; }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    const uint8_t oldSrc = g_set.src;
+    const String oldKey = g_set.key(), oldBase = g_set.base();
+    String k = g_web.arg("fkkey"); k.trim();
+    if (k.length()) g_set.fkKey = k;
+    k = g_web.arg("etkey"); k.trim();
+    if (k.length()) g_set.etKey = k;
+    if (g_web.hasArg("src"))    g_set.src = g_web.arg("src").toInt() == SRC_ETSY ? SRC_ETSY : SRC_FAIRKEEP;
+    if (g_web.hasArg("fkmode")) g_set.fkMode = g_web.arg("fkmode").toInt() % FK_COUNT;
+    if (g_web.hasArg("etmode")) g_set.etMode = g_web.arg("etmode").toInt() % ET_COUNT;
+    if (g_web.hasArg("poll"))   g_set.pollS = constrain(g_web.arg("poll").toInt(), MIN_POLL_S, MAX_POLL_S);
+    if (g_web.hasArg("bright")) g_set.bright = constrain(g_web.arg("bright").toInt(), 10, 255);
+    g_set.cents     = g_web.hasArg("cents");
+    g_set.tapCycles = g_web.hasArg("tap");
+    g_set.etNet     = g_web.hasArg("etnet");
+    g_set.etLabels  = g_web.hasArg("etlbl");
+    String b = g_web.arg("fkbase"); b.trim();
+    if (b.startsWith("https://")) g_set.fkBase = b;
+    b = g_web.arg("etbase"); b.trim();
+    if (b.startsWith("https://")) g_set.etBase = b;
+    const bool changed = g_set.src != oldSrc || g_set.key() != oldKey || g_set.base() != oldBase;
+    xSemaphoreGive(g_lock);
+    saveSettings();
+    if (changed) resetData();
+    ui_set_cents(g_set.cents);
+    display::setBrightness(g_set.bright);
+    renderView();
+    g_fetchNow = true;
+    sendBack("Saved.");
+}
+
+static void handleRefresh() {
+    if (crossSite()) { g_web.send(403, "text/plain", "cross-site request rejected"); return; }
+    g_fetchNow = true;
+    sendBack("Refreshing&hellip;");
+}
+
+static void handleWifiReset() {
+    if (crossSite()) { g_web.send(403, "text/plain", "cross-site request rejected"); return; }
+    sendBack("WiFi forgotten. Join <b>" SETUP_AP_NAME "</b> to set it up again.");
+    delay(500);
+    g_wm.resetSettings();
+    ESP.restart();
+}
+
+static bool g_updateOk = false;
+static void handleUpdateDone() {
+    if (!g_updateOk) { g_web.send(400, "text/plain", "Update failed: " + String(Update.errorString())); return; }
+    sendBack("Update installed. Restarting&hellip;");
+    delay(800);
+    ESP.restart();
+}
+static void handleUpdateUpload() {
+    HTTPUpload &up = g_web.upload();
+    if (up.status == UPLOAD_FILE_START) {
+        g_updateOk = false;
+        if (crossSite()) return;
+        ui_set_message("Updating", "Installing new firmware...");
+        Update.begin(UPDATE_SIZE_UNKNOWN);
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (Update.isRunning()) Update.write(up.buf, up.currentSize);
+    } else if (up.status == UPLOAD_FILE_END) {
+        g_updateOk = Update.isRunning() && Update.end(true);
+        if (!g_updateOk) ui_set_message(nullptr, nullptr);
+    }
+}
+
+static void startWeb() {
+    static const char *hdrs[] = { "Origin" };
+    g_web.collectHeaders(hdrs, 1);
+    g_web.on("/", HTTP_GET, handleRoot);
+    g_web.on("/save", HTTP_POST, handleSave);
+    g_web.on("/refresh", HTTP_POST, handleRefresh);
+    g_web.on("/wifi", HTTP_POST, handleWifiReset);
+    g_web.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
+    g_web.onNotFound([] { g_web.send(404, "text/plain", "not found"); });
+    g_web.begin();
+    if (MDNS.begin(MDNS_HOST)) MDNS.addService("http", "tcp", 80);
+    Serial.printf("[web] http://%s/  (http://" MDNS_HOST ".local/)\n", WiFi.localIP().toString().c_str());
+}
+
+// ------------------------------------------------------------------ touch actions
+static uint32_t g_modeSaveAt = 0;
+static void onTap() {
+    if (!g_set.tapCycles) return;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_set.src == SRC_ETSY) g_set.etMode = (g_set.etMode + 1) % ET_COUNT;
+    else                       g_set.fkMode = (g_set.fkMode + 1) % FK_COUNT;
+    xSemaphoreGive(g_lock);
+    renderView();
+    g_modeSaveAt = millis() + 3000;     // save once the taps settle
+}
+static void onLongPress() {
+    g_fetchNow = true;
+    ui_set_status("refreshing...", false);
+}
+
+// ------------------------------------------------------------------ status line
+static void refreshScreenState() {
+    String err, warn; uint32_t lastOk; bool have; String key;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    err = g_err; warn = g_warn; lastOk = g_lastOkMs; key = g_set.key();
+    have = g_set.src == SRC_ETSY ? g_et.have : g_fk.have;
+    const bool etsy = g_set.src == SRC_ETSY;
+    xSemaphoreGive(g_lock);
+
+    if (!g_netUp) {
+        ui_set_message("Set up WiFi", "On your phone, join\n" SETUP_AP_NAME "\nthen pick your network and paste your FairKeep API key or Etsy dial key.");
+        ui_set_status("", false);
+        return;
+    }
+    if (key.isEmpty()) {
+        String body = "Open http://" + WiFi.localIP().toString() + "/\non this WiFi and paste your " +
+                      (etsy ? "Etsy dial service key." : "FairKeep API key.");
+        ui_set_message("Add key", body.c_str());
+        ui_set_status("", false);
+        return;
+    }
+    if (!have && err.length()) {
+        String body = err + "\n\nSettings: http://" + WiFi.localIP().toString() + "/";
+        ui_set_message(etsy ? "Can't load Etsy" : "Can't load sales", body.c_str());
+        ui_set_status("", false);
+        return;
+    }
+    ui_set_message(nullptr, nullptr);
+
+    char line[96];
+    if (err.length()) {
+        snprintf(line, sizeof(line), "%s", err.c_str());
+        ui_set_status(line, true);
+    } else if (warn.length()) {
+        snprintf(line, sizeof(line), "%s", warn.c_str());
+        ui_set_status(line, true);
+    } else if (lastOk) {
+        const uint32_t s = (millis() - lastOk) / 1000;
+        if (s < 60) snprintf(line, sizeof(line), "updated just now");
+        else        snprintf(line, sizeof(line), "updated %lum ago", (unsigned long)(s / 60));
+        ui_set_status(line, false);
+    } else {
+        ui_set_status("loading...", false);
+    }
+}
+
+// ------------------------------------------------------------------ setup / loop
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+    Serial.println("\n[" FW_NAME " " FW_VERSION "] boot");
+    g_lock = xSemaphoreCreateMutex();
+    loadSettings();
+    g_dataSrc = g_set.src;
+
+    if (!display::begin()) Serial.println("[boot] display failed");
+    battery_begin();
+    display::setBrightness(g_set.bright);
+    ui_create(onTap, onLongPress);
+    ui_set_cents(g_set.cents);
+    renderView();
+    ui_set_message("FairKeep Dial", "Connecting to WiFi...");
+    display::loop();
+
+    // Setup hotspot: non-blocking so the screen keeps drawing while it is open.
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(MDNS_HOST);
+    g_wm.setDebugOutput(false);
+    g_wm.setTitle(FW_NAME);
+    g_wm.setConfigPortalBlocking(false);
+    g_wm.setConnectTimeout(20);
+    g_wm.addParameter(&g_wmKey);
+    g_wm.setSaveConfigCallback([] { g_portalSaved = true; });
+    g_wm.setCustomHeadElement(
+        "<style>body{background:#0b1424;color:#f4ebdd}button{background:#f2a93b;color:#0b1424}"
+        "input{background:#131f35;color:#f4ebdd;border:1px solid #2a3a58}</style>");
+    if (g_wm.autoConnect(SETUP_AP_NAME)) {
+        g_netUp = true;
+        startWeb();
+    } else {
+        Serial.println("[wifi] setup hotspot open: " SETUP_AP_NAME);
+    }
+
+    xTaskCreatePinnedToCore(fetchTask, "fetch", 12288, nullptr, 1, nullptr, 0);
+    refreshScreenState();
+}
+
+void loop() {
+    display::loop();
+
+    if (!g_netUp) {
+        g_wm.process();
+        if (g_portalSaved) {
+            applyKey(String(g_wmKey.getValue()));
+            saveSettings();
+            Serial.println("[wifi] saved from setup page -> restarting");
+            ui_set_message("Saved", "Restarting...");
+            for (int i = 0; i < 20; ++i) { display::loop(); delay(25); }
+            ESP.restart();
+        }
+    } else {
+        g_web.handleClient();
+    }
+
+    bool dirty = false;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_dirty) { dirty = true; g_dirty = false; }
+    xSemaphoreGive(g_lock);
+    if (dirty) { renderView(); refreshScreenState(); }
+
+    static uint32_t lastStatus = 0;
+    if (millis() - lastStatus > 5000) { lastStatus = millis(); refreshScreenState(); }
+
+    static uint32_t lastBatt = 0;
+    if (millis() - lastBatt > 30000 || lastBatt == 0) {
+        lastBatt = millis();
+        ui_set_battery(battery_percent(), battery_charging(), battery_present());
+    }
+
+    if (g_modeSaveAt && (int32_t)(millis() - g_modeSaveAt) >= 0) { g_modeSaveAt = 0; saveSettings(); }
+
+    delay(5);
+}

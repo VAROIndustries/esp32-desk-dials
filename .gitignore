@@ -1,0 +1,4 @@
+firmware/.pio/
+firmware/tools/node_modules/
+__pycache__/
+*.pyc
