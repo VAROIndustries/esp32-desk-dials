@@ -141,8 +141,20 @@ def hetzner_servers(token: str, cpu_warn: float) -> list[dict]:
 
 def coolify_get(base: str, token: str, path: str):
     r = requests.get(base.rstrip("/") + "/api/v1" + path, headers={"Authorization": f"Bearer {token}", **UA}, timeout=15)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # Coolify says why (IP not allowed, missing ability, bad token) in the body; keep it.
+        try:
+            msg = (r.json() or {}).get("message") or r.text
+        except ValueError:
+            msg = r.text
+        raise CoolifyError(r.status_code, str(msg)[:160])
     return r.json()
+
+
+class CoolifyError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(f"HTTP {status}: {message}")
+        self.status, self.message = status, message
 
 
 def coolify_instance(name: str, base: str, token: str) -> dict:
@@ -228,9 +240,15 @@ class Monitor:
                 continue
             try:
                 inst = coolify_instance(name, base, tok)
+            except CoolifyError as e:
+                why = "API not allowed from this IP" if "not allowed" in e.message.lower() else \
+                      "token rejected" if e.status == 401 else f"API error {e.status}"
+                monitor_errors.append(f"Coolify {name}: {why}")
+                print(f"[coolify] {name} {base}: {e}", flush=True)
+                continue
             except Exception as e:
                 monitor_errors.append(f"Coolify {name}: unreachable")
-                traceback.print_exc()
+                print(f"[coolify] {name} {base}: {e!r}", flush=True)
                 continue
             for srv in inst["servers"]:
                 if not srv["reachable"]:
