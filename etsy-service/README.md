@@ -41,7 +41,9 @@ own.
 
 Load: the first sync reads the year's receipts and the payment ledger (Etsy caps ledger queries at 31
 days, so it walks the year in 30-day windows); after that it fetches only what changed every
-3 minutes, and re-reads receipts in full every 6 hours to catch late refunds.
+5 minutes, and re-reads receipts in full every 6 hours to catch late refunds. That is roughly 600
+requests a day at no more than 4 a second — well inside a personal Etsy app's 5/second and
+5,000/day, which the app shares with any other tool using the same keystring.
 
 *The term 'Etsy' is a trademark of Etsy, Inc. This application uses the Etsy API but is not endorsed or
 certified by Etsy, Inc.*

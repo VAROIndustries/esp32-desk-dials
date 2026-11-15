@@ -33,7 +33,7 @@ Environment:
   PUBLIC_URL                           e.g. https://etsydial.example.com (for the OAuth redirect)
   TZ_NAME                              default America/New_York
   DATA_DIR                             default /data  (mount a persistent volume here)
-  SYNC_SECONDS                         default 180
+  SYNC_SECONDS                         default 300
 """
 from __future__ import annotations
 
@@ -234,7 +234,7 @@ class EtsyClient:
             off += 100
             if not res or off >= d.get("count", 0):
                 break
-            time.sleep(0.12)   # stay well under 10 requests/second
+            time.sleep(0.25)   # personal Etsy apps get 5 requests/second, shared with every other tool on the app
 
 
 # ------------------------------------------------------------------ store + sync
@@ -344,7 +344,7 @@ class App:
         os.makedirs(data, exist_ok=True)
         self.client = EtsyClient(self.keystring, self.secret, os.path.join(data, "etsy_tokens.json"))
         self.store = Store(os.path.join(data, "state.json"), self.tz)
-        self.sync_seconds = max(60, int(os.environ.get("SYNC_SECONDS", "180")))
+        self.sync_seconds = max(60, int(os.environ.get("SYNC_SECONDS", "300")))
         self.pending = {}   # oauth state -> (verifier, created)
         self.kick = threading.Event()
 
