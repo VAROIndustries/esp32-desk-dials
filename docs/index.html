@@ -50,7 +50,7 @@
       <p>Your takings, live on your desk.</p>
       <ul>
         <li><b>FairKeep:</b> today's sales across your shows and web orders &mdash; total, POS, web, or all three.</li>
-        <li><b>Etsy:</b> today, this month and this year &mdash; orders and gross, or after Etsy fees.</li>
+        <li><b>Etsy:</b> today, this month and this year &mdash; orders and gross, or after Etsy fees &mdash; plus how many orders are waiting to ship (amber when one is due today, red when overdue).</li>
         <li>Tap to change view, or lock each dial to one.</li>
       </ul>
       <a class="btn" href="sales/">Install the Sales Dial</a>
@@ -63,6 +63,19 @@
       <p>Live aircraft around you on a radar scope: callsign, altitude, speed, heading and route, with swipeable radar, list and stats views.</p>
       <a class="btn ext" href="https://socquique.github.io/capsule-radar/" rel="noopener">Install Capsule Radar &#8599;</a>
       <p class="credit">By Quique Tortosa &mdash; <a href="https://github.com/socquique/capsule-radar" rel="noopener">github.com/socquique/capsule-radar</a> (MIT). Our dials build on its display and touch drivers.</p>
+    </div>
+
+    <div class="dial">
+      <div class="faces"><img src="sales/img/status.png" alt="Server Status dial with two resources down"><img src="sales/img/servers.png" alt="Server Status dial showing server CPU"></div>
+      <h2>Server Status</h2>
+      <div><span class="tag">Coolify</span><span class="tag">Hetzner</span></div>
+      <p>Every app, service, database, domain and server you run, one dot each round the edge.</p>
+      <ul>
+        <li>Green when everything answers; the number turns amber or red and the dial names what broke.</li>
+        <li>Second view: each Hetzner server and its CPU.</li>
+        <li>Reads a small status service you host (the <code>status-service</code> folder) with read-only API tokens.</li>
+      </ul>
+      <a class="btn" href="sales/#status">Install (same firmware)</a>
     </div>
 
     <div class="dial soon">

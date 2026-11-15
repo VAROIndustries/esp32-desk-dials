@@ -26,9 +26,11 @@
 #include "battery.h"
 #include "ui.h"
 
-enum Source : uint8_t { SRC_FAIRKEEP = 0, SRC_ETSY = 1 };
+enum Source : uint8_t { SRC_FAIRKEEP = 0, SRC_ETSY = 1, SRC_STATUS = 2, SRC_COUNT };
 enum FkMode : uint8_t { FK_TOTAL = 0, FK_POS, FK_WEB, FK_ALL, FK_COUNT };
-enum EtMode : uint8_t { ET_TODAY = 0, ET_MONTH, ET_YEAR, ET_COUNT };
+enum EtMode : uint8_t { ET_TODAY = 0, ET_MONTH, ET_YEAR, ET_SHIP, ET_COUNT };
+enum StMode : uint8_t { ST_ALL = 0, ST_SERVERS, ST_COUNT };
+static const int ET_PERIODS = 3;   // today / month / year come as money periods; ET_SHIP is the to-ship count
 
 // ------------------------------------------------------------------ settings
 struct Settings {
@@ -37,6 +39,8 @@ struct Settings {
     uint8_t  fkMode = FK_TOTAL;
     String   etKey, etBase = DEFAULT_ETSY_BASE;
     uint8_t  etMode = ET_TODAY;
+    String   stKey, stBase = DEFAULT_STATUS_BASE;
+    uint8_t  stMode = ST_ALL;
     bool     etNet = false;      // show after Etsy fees instead of gross
     bool     etLabels = false;   // ...and after postage labels too
     bool     tapCycles = true;   // false = view locked to the one picked on the settings page
@@ -44,8 +48,8 @@ struct Settings {
     bool     cents = false;
     uint8_t  bright = DEFAULT_BRIGHTNESS;
 
-    const String &key() const  { return src == SRC_ETSY ? etKey : fkKey; }
-    const String &base() const { return src == SRC_ETSY ? etBase : fkBase; }
+    const String &key() const  { return src == SRC_ETSY ? etKey : src == SRC_STATUS ? stKey : fkKey; }
+    const String &base() const { return src == SRC_ETSY ? etBase : src == SRC_STATUS ? stBase : fkBase; }
 };
 static Settings    g_set;
 static Preferences g_prefs;
@@ -54,13 +58,17 @@ static Preferences g_prefs;
 // dial updated over the air keeps its setup.
 static void loadSettings() {
     g_prefs.begin("fkdial", true);
-    g_set.src      = g_prefs.getUChar("src", SRC_FAIRKEEP) > SRC_ETSY ? SRC_FAIRKEEP : g_prefs.getUChar("src", SRC_FAIRKEEP);
+    g_set.src      = g_prefs.getUChar("src", SRC_FAIRKEEP);
+    if (g_set.src >= SRC_COUNT) g_set.src = SRC_FAIRKEEP;
     g_set.fkKey    = g_prefs.getString("apikey", "");
     g_set.fkBase   = g_prefs.getString("apibase", DEFAULT_API_BASE);
     g_set.fkMode   = g_prefs.getUChar("mode", FK_TOTAL) % FK_COUNT;
     g_set.etKey    = g_prefs.getString("etkey", "");
     g_set.etBase   = g_prefs.getString("etbase", DEFAULT_ETSY_BASE);
     g_set.etMode   = g_prefs.getUChar("etmode", ET_TODAY) % ET_COUNT;
+    g_set.stKey    = g_prefs.getString("stkey", "");
+    g_set.stBase   = g_prefs.getString("stbase", DEFAULT_STATUS_BASE);
+    g_set.stMode   = g_prefs.getUChar("stmode", ST_ALL) % ST_COUNT;
     g_set.etNet    = g_prefs.getBool("etnet", false);
     g_set.etLabels = g_prefs.getBool("etlbl", false);
     g_set.tapCycles = g_prefs.getBool("tap", true);
@@ -79,6 +87,9 @@ static void saveSettings() {
     g_prefs.putString("etkey", g_set.etKey);
     g_prefs.putString("etbase", g_set.etBase);
     g_prefs.putUChar("etmode", g_set.etMode);
+    g_prefs.putString("stkey", g_set.stKey);
+    g_prefs.putString("stbase", g_set.stBase);
+    g_prefs.putUChar("stmode", g_set.stMode);
     g_prefs.putBool("etnet", g_set.etNet);
     g_prefs.putBool("etlbl", g_set.etLabels);
     g_prefs.putBool("tap", g_set.tapCycles);
@@ -100,15 +111,36 @@ struct EtPeriod {
     int   orders = 0;
     float gross = 0, fees = 0, labels = 0;
 };
+struct EtShip {
+    bool  have = false;           // false = service too old to send it
+    int   orders = 0, overdue = 0, dueToday = 0;
+    char  next[16] = "";          // "Mon Nov 23"
+};
 struct EtData {
     bool     have = false;
-    EtPeriod p[ET_COUNT];
+    EtPeriod p[ET_PERIODS];
+    EtShip   ship;
+};
+#define ST_MAX_SERVERS 5
+#define ST_MAX_PROBLEMS 3
+struct StServer  { char name[20] = ""; char state = 'U'; int cpu = -1; };
+struct StProblem { char name[28] = ""; char why[32] = ""; char state = 'D'; };
+struct StData {
+    bool      have = false;
+    char      overall = 'U';
+    int       up = 0, warn = 0, down = 0, stopped = 0, total = 0, nProblems = 0;
+    int       nServers = 0, serversUp = 0;
+    StServer  srv[ST_MAX_SERVERS];
+    StProblem prob[ST_MAX_PROBLEMS];
+    char      dots[161] = "";
+    int       age = 0;
 };
 
 // Written by the fetch task (core 0), read by the UI loop (core 1).
 static SemaphoreHandle_t g_lock;
 static FkData            g_fk;
 static EtData            g_et;
+static StData            g_st;
 static bool              g_dirty = true;
 static String            g_err;            // last error, "" = last fetch ok
 static String            g_warn;           // non-fatal note from the server (e.g. Etsy sync delayed)
@@ -132,6 +164,7 @@ static void resetData() {
     xSemaphoreTake(g_lock, portMAX_DELAY);
     g_fk = FkData();
     g_et = EtData();
+    g_st = StData();
     g_err = "";
     g_warn = "";
     g_lastOkMs = 0;
@@ -151,8 +184,8 @@ static void doFetch() {
     if (key.isEmpty() || WiFi.status() != WL_CONNECTED) return;
 
     while (base.endsWith("/")) base.remove(base.length() - 1);
-    const String url = base + (src == SRC_ETSY ? "/summary" : "/device/today");
-    const char *who = src == SRC_ETSY ? "the Etsy dial service" : "FairKeep";
+    const String url = base + (src == SRC_ETSY ? "/summary" : src == SRC_STATUS ? "/status" : "/device/today");
+    const char *who = src == SRC_ETSY ? "the Etsy dial service" : src == SRC_STATUS ? "the status service" : "FairKeep";
 
     NetworkClientSecure client;
     client.setCACert(ROOT_CAS);
@@ -180,8 +213,8 @@ static void doFetch() {
         String msg = (!jerr && doc["error"].is<const char *>()) ? String((const char *)doc["error"]) : String();
         Serial.printf("[fetch] HTTP %d %s\n", code, msg.c_str());
         if (code == 401)      setError("Key rejected - update it on the setup page");
-        else if (code == 404) setError(src == SRC_ETSY ? "Etsy dial service not found - check the URL"
-                                                       : "FairKeep doesn't have the dial endpoint yet");
+        else if (code == 404) setError(src == SRC_FAIRKEEP ? "FairKeep doesn't have the dial endpoint yet"
+                                                           : String(who) + " not found - check the URL");
         else if (code == 429) setError("Too many requests - slow the refresh down");
         else if (msg.length()) setError(msg);
         else                  setError(String(who) + " error " + String(code));
@@ -191,11 +224,49 @@ static void doFetch() {
 
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (src != g_set.src) { xSemaphoreGive(g_lock); return; }   // source changed mid-fetch
-    if (src == SRC_ETSY) {
-        static const char *names[ET_COUNT] = { "today", "month", "year" };
+    if (src == SRC_STATUS) {
+        StData t;
+        t.have = true;
+        const char *ov = doc["overall"] | "up";
+        t.overall = (char)toupper((unsigned char)ov[0]);
+        t.up = doc["counts"]["up"] | 0;       t.warn = doc["counts"]["warn"] | 0;
+        t.down = doc["counts"]["down"] | 0;   t.stopped = doc["counts"]["stopped"] | 0;
+        t.total = doc["counts"]["total"] | 0;
+        for (JsonObject o : doc["servers"].as<JsonArray>()) {
+            const char *st = o["state"] | "up";
+            if (st[0] == 'u') t.serversUp++;
+            if (t.nServers >= ST_MAX_SERVERS) { t.nServers++; continue; }
+            StServer &v = t.srv[t.nServers++];
+            strlcpy(v.name, o["name"] | "?", sizeof(v.name));
+            v.state = (char)toupper((unsigned char)st[0]);
+            v.cpu = o["cpu"].isNull() ? -1 : (int)lroundf(o["cpu"].as<float>());
+        }
+        for (JsonObject o : doc["problems"].as<JsonArray>()) {
+            if (t.nProblems >= ST_MAX_PROBLEMS) { t.nProblems++; continue; }
+            StProblem &v = t.prob[t.nProblems++];
+            strlcpy(v.name, o["name"] | "?", sizeof(v.name));
+            strlcpy(v.why, o["why"] | "", sizeof(v.why));
+            const char *st = o["state"] | "down";
+            v.state = (char)toupper((unsigned char)st[0]);
+        }
+        t.nProblems = doc["problems"].as<JsonArray>().size();
+        strlcpy(t.dots, doc["dots"] | "", sizeof(t.dots));
+        t.age = doc["ageSeconds"] | 0;
+        g_st = t;
+        g_warn = t.age > 600 ? String("status service hasn't checked in ") + String(t.age / 60) + "m" : String();
+    } else if (src == SRC_ETSY) {
+        static const char *names[ET_PERIODS] = { "today", "month", "year" };
         EtData e;
         e.have = true;
-        for (int i = 0; i < ET_COUNT; ++i) {
+        JsonObject ts = doc["toShip"];
+        if (!ts.isNull()) {
+            e.ship.have     = true;
+            e.ship.orders   = ts["orders"] | 0;
+            e.ship.overdue  = ts["overdue"] | 0;
+            e.ship.dueToday = ts["dueToday"] | 0;
+            strlcpy(e.ship.next, ts["nextShipBy"] | "", sizeof(e.ship.next));
+        }
+        for (int i = 0; i < ET_PERIODS; ++i) {
             JsonObject o = doc[names[i]];
             strlcpy(e.p[i].label, o["label"] | "", sizeof(e.p[i].label));
             e.p[i].orders = o["orders"] | 0;
@@ -224,7 +295,7 @@ static void doFetch() {
     g_lastOkMs = millis();
     g_dirty = true;
     xSemaphoreGive(g_lock);
-    Serial.printf("[fetch] ok (%s)\n", src == SRC_ETSY ? "etsy" : "fairkeep");
+    Serial.printf("[fetch] ok (%s)\n", src == SRC_ETSY ? "etsy" : src == SRC_STATUS ? "status" : "fairkeep");
 }
 
 static void fetchTask(void *) {
@@ -250,14 +321,110 @@ static void ordersText(char *out, size_t n, int orders) {
     snprintf(out, n, "%d order%s", orders, orders == 1 ? "" : "s");
 }
 
+static int sev(char c) { return c == 'D' ? 3 : c == 'W' ? 2 : c == 'U' ? 1 : 0; }
+
 static void upper(char *s) { for (; *s; ++s) *s = (char)toupper((unsigned char)*s); }
+
+// LVGL recolour uses '#'; keep it out of names that come from elsewhere.
+static void noHash(char *s) { for (; *s; ++s) if (*s == '#') *s = ' '; }
+
+static uint8_t toneFor(char state) { return state == 'D' ? 2 : state == 'W' ? 1 : 0; }
+
+static ViewData buildStatusView() {
+    ViewData v;
+    const StData &t = g_st;
+    v.have = t.have;
+    v.listSub = true;
+    if (!t.have) { snprintf(v.header, sizeof(v.header), "SERVER STATUS"); return v; }
+    char line[64];
+    if (g_set.stMode == ST_SERVERS) {
+        snprintf(v.header, sizeof(v.header), "SERVERS");
+        snprintf(v.bigText, sizeof(v.bigText), "%d/%d", t.serversUp, t.nServers);
+        char worst = 'U';
+        for (int i = 0; i < t.nServers && i < ST_MAX_SERVERS; ++i) {
+            const StServer &s = t.srv[i];
+            if (sev(s.state) > sev(worst)) worst = s.state;
+            char nm[20]; strlcpy(nm, s.name, sizeof(nm)); noHash(nm);
+            const char *col = s.state == 'D' ? "#F87171 " : s.state == 'W' ? "#F2A93B " : "";
+            if (s.state == 'D')    snprintf(line, sizeof(line), "%s%s  off#", col, nm);
+            else if (s.cpu >= 0)   snprintf(line, sizeof(line), "%s%s  %d%%%s", col, nm, s.cpu, col[0] ? "#" : "");
+            else                   snprintf(line, sizeof(line), "%s%s%s", col, nm, col[0] ? "#" : "");
+            if (v.sub[0]) strlcat(v.sub, "\n", sizeof(v.sub));
+            strlcat(v.sub, line, sizeof(v.sub));
+        }
+        if (!t.nServers) strlcpy(v.sub, "no Hetzner servers", sizeof(v.sub));
+        v.tone = toneFor(worst);
+        return v;
+    }
+    // everything: apps, services, databases, domains, servers
+    const int watched = t.total - t.stopped;
+    snprintf(v.bigText, sizeof(v.bigText), "%d/%d", t.up, watched);
+    v.tone = t.down ? 2 : t.warn ? 1 : 0;
+    strlcpy(v.ring, t.dots, sizeof(v.ring));
+    if (t.down)      snprintf(v.header, sizeof(v.header), "%d DOWN", t.down);
+    else if (t.warn) snprintf(v.header, sizeof(v.header), "%d WARNING%s", t.warn, t.warn == 1 ? "" : "S");
+    else             snprintf(v.header, sizeof(v.header), "ALL SYSTEMS UP");
+    const int listed = t.nProblems < ST_MAX_PROBLEMS ? t.nProblems : ST_MAX_PROBLEMS;
+    // three lines fit; if there are more problems the third says how many
+    const int rows = t.nProblems > ST_MAX_PROBLEMS ? ST_MAX_PROBLEMS - 1 : listed;
+    for (int i = 0; i < rows; ++i) {
+        const StProblem &p = t.prob[i];
+        char nm[28], why[32];
+        strlcpy(nm, p.name, sizeof(nm)); noHash(nm);
+        strlcpy(why, p.why, sizeof(why)); noHash(why);
+        snprintf(line, sizeof(line), "%s%.18s#  %.22s", p.state == 'D' ? "#F87171 " : "#F2A93B ", nm, why);
+        if (v.sub[0]) strlcat(v.sub, "\n", sizeof(v.sub));
+        strlcat(v.sub, line, sizeof(v.sub));
+    }
+    if (t.nProblems > ST_MAX_PROBLEMS) {
+        snprintf(line, sizeof(line), "\n+%d more", t.nProblems - rows);
+        strlcat(v.sub, line, sizeof(v.sub));
+    }
+    if (!t.nProblems) {
+        if (t.stopped) snprintf(v.sub, sizeof(v.sub), "%d up  -  %d stopped", t.up, t.stopped);
+        else           snprintf(v.sub, sizeof(v.sub), "%d up", t.up);
+    }
+    return v;
+}
+
+static ViewData buildShipView() {
+    ViewData v;
+    const EtShip &s = g_et.ship;
+    snprintf(v.header, sizeof(v.header), "ETSY  -  TO SHIP");
+    v.have = g_et.have;
+    if (!s.have) {
+        strlcpy(v.bigText, "--", sizeof(v.bigText));
+        v.tone = 3;
+        strlcpy(v.sub, "update the Etsy dial service", sizeof(v.sub));
+        return v;
+    }
+    snprintf(v.bigText, sizeof(v.bigText), "%d", s.orders);
+    if (s.overdue) {
+        v.tone = 2;
+        if (s.dueToday) snprintf(v.sub, sizeof(v.sub), "%d overdue  -  %d due today", s.overdue, s.dueToday);
+        else            snprintf(v.sub, sizeof(v.sub), "%d overdue", s.overdue);
+    } else if (s.dueToday) {
+        v.tone = 1;
+        snprintf(v.sub, sizeof(v.sub), "%d due today", s.dueToday);
+    } else if (s.orders) {
+        v.tone = 3;
+        if (s.next[0]) snprintf(v.sub, sizeof(v.sub), "next ship-by %s", s.next);
+        else           snprintf(v.sub, sizeof(v.sub), "order%s to ship", s.orders == 1 ? "" : "s");
+    } else {
+        v.tone = 0;
+        strlcpy(v.sub, "all shipped", sizeof(v.sub));
+    }
+    return v;
+}
 
 // Build the screen from the data + settings. Caller holds g_lock.
 static ViewData buildView() {
+    if (g_set.src == SRC_STATUS) return buildStatusView();
+    if (g_set.src == SRC_ETSY && g_set.etMode == ET_SHIP) return buildShipView();
     ViewData v;
     if (g_set.src == SRC_ETSY) {
         const EtPeriod &p = g_et.p[g_set.etMode];
-        static const char *fallback[ET_COUNT] = { "TODAY", "THIS MONTH", "THIS YEAR" };
+        static const char *fallback[ET_PERIODS] = { "TODAY", "THIS MONTH", "THIS YEAR" };
         char lbl[24];
         // "Today" reads better than the date the service sends for the day view.
         snprintf(lbl, sizeof(lbl), "%s", g_set.etMode == ET_TODAY || !p.label[0] ? fallback[g_set.etMode] : p.label);
@@ -310,8 +477,9 @@ static ViewData buildView() {
 static void renderView() {
     xSemaphoreTake(g_lock, portMAX_DELAY);
     ViewData v = buildView();
-    const int count = g_set.tapCycles ? (g_set.src == SRC_ETSY ? (int)ET_COUNT : (int)FK_COUNT) : 0;
-    const int active = g_set.src == SRC_ETSY ? g_set.etMode : g_set.fkMode;
+    const int count = !g_set.tapCycles ? 0 : g_set.src == SRC_ETSY ? (int)ET_COUNT
+                    : g_set.src == SRC_STATUS ? (int)ST_COUNT : (int)FK_COUNT;
+    const int active = g_set.src == SRC_ETSY ? g_set.etMode : g_set.src == SRC_STATUS ? g_set.stMode : g_set.fkMode;
     xSemaphoreGive(g_lock);
     ui_set_dots(count, active);
     ui_set_view(v);
@@ -319,18 +487,19 @@ static void renderView() {
 
 // ------------------------------------------------------------------ wifi + setup portal
 static WiFiManager          g_wm;
-static WiFiManagerParameter g_wmKey("apikey", "FairKeep API key (bb_live_...) or Etsy dial key", "", 80);
+static WiFiManagerParameter g_wmKey("apikey", "FairKeep API key (bb_live_...), Etsy dial key, or status key (st_...)", "", 80);
 static bool                 g_portalSaved = false;
 static bool                 g_netUp = false;
 
-// A key from the setup hotspot: FairKeep keys start with bb_live_, anything else is an
-// Etsy dial service key.
+// A key from the setup hotspot: FairKeep keys start with bb_live_, status service keys
+// with st_, anything else is an Etsy dial service key.
 static void applyKey(String k) {
     k.trim();
     if (!k.length()) return;
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (k.startsWith("bb_live_")) { g_set.fkKey = k; g_set.src = SRC_FAIRKEEP; }
-    else                          { g_set.etKey = k; g_set.src = SRC_ETSY; }
+    if (k.startsWith("bb_live_"))  { g_set.fkKey = k; g_set.src = SRC_FAIRKEEP; }
+    else if (k.startsWith("st_"))  { g_set.stKey = k; g_set.src = SRC_STATUS; }
+    else                           { g_set.etKey = k; g_set.src = SRC_ETSY; }
     xSemaphoreGive(g_lock);
 }
 
@@ -403,16 +572,18 @@ static void handleRoot() {
     else                       status = "Waiting for first update&hellip;";
     if (warn.length()) status += "<br><span class=err>" + htmlEscape(warn) + "</span>";
 
-    static const char *srcNames[] = { "FairKeep (today's POS + web sales)", "Etsy (via an Etsy dial service)" };
+    static const char *srcNames[SRC_COUNT] = { "FairKeep (today's POS + web sales)", "Etsy (via an Etsy dial service)",
+                                                "Server status (via a status service)" };
     static const char *fkNames[FK_COUNT] = { "Total (POS + web)", "POS only", "Web only", "All three" };
-    static const char *etNames[ET_COUNT] = { "Today", "This month", "This year" };
+    static const char *etNames[ET_COUNT] = { "Today", "This month", "This year", "To ship" };
+    static const char *stNames[ST_COUNT] = { "Everything", "Servers (CPU)" };
 
     String p = FPSTR(PAGE_HEAD);
     p += "<h1>FairKeep Dial</h1><p class=sub>" FW_VERSION " &middot; " + WiFi.localIP().toString() + " &middot; " + htmlEscape(WiFi.SSID()) + "</p>";
     p += "<div class=card>" + status + "</div>";
     p += "<form method=POST action=/save>";
 
-    p += "<div class=card><label>Show</label><select name=src>" + options(srcNames, 2, s.src) + "</select>";
+    p += "<div class=card><label>Show</label><select name=src>" + options(srcNames, SRC_COUNT, s.src) + "</select>";
     p += checkbox("tap", s.tapCycles, "Tap the dial to change view (untick to lock it to the view below)");
     p += checkbox("cents", s.cents, "Show cents") + "</div>";
 
@@ -431,6 +602,13 @@ static void handleRoot() {
          "Fees = everything Etsy charged that period: transaction, processing, ads, listing and subscription fees.</p>"
          "<p class=sub style='margin:10px 0 0;font-size:11px'>The term 'Etsy' is a trademark of Etsy, Inc. This application uses the Etsy API but is not endorsed or certified by Etsy, Inc.</p>";
     p += "<label>Service URL</label><input name=etbase value='" + htmlEscape(s.etBase) + "'></div>";
+
+    p += "<div class=card><h2>Server status</h2>";
+    p += "<label>Status service key</label>" + keyField("stkey", s.stKey, "st_...  (the SERVICE_KEY of your status service)");
+    p += "<label>View</label><select name=stmode>" + options(stNames, ST_COUNT, s.stMode) + "</select>";
+    p += "<p class=sub style='margin:6px 0 0'>Everything = every Coolify app, service and database, every domain and every Hetzner server; "
+         "a dot round the edge for each. Servers = each Hetzner server with its CPU.</p>";
+    p += "<label>Service URL</label><input name=stbase value='" + htmlEscape(s.stBase) + "'></div>";
 
     p += "<div class=card><label>Refresh every (seconds, " + String(MIN_POLL_S) + "&ndash;" + String(MAX_POLL_S) + ")</label>";
     p += "<input type=number name=poll min=" + String(MIN_POLL_S) + " max=" + String(MAX_POLL_S) + " value=" + String(s.pollS) + ">";
@@ -464,7 +642,10 @@ static void handleSave() {
     if (k.length()) g_set.fkKey = k;
     k = g_web.arg("etkey"); k.trim();
     if (k.length()) g_set.etKey = k;
-    if (g_web.hasArg("src"))    g_set.src = g_web.arg("src").toInt() == SRC_ETSY ? SRC_ETSY : SRC_FAIRKEEP;
+    k = g_web.arg("stkey"); k.trim();
+    if (k.length()) g_set.stKey = k;
+    if (g_web.hasArg("src"))    { const int v = g_web.arg("src").toInt(); g_set.src = v >= 0 && v < SRC_COUNT ? v : SRC_FAIRKEEP; }
+    if (g_web.hasArg("stmode")) g_set.stMode = g_web.arg("stmode").toInt() % ST_COUNT;
     if (g_web.hasArg("fkmode")) g_set.fkMode = g_web.arg("fkmode").toInt() % FK_COUNT;
     if (g_web.hasArg("etmode")) g_set.etMode = g_web.arg("etmode").toInt() % ET_COUNT;
     if (g_web.hasArg("poll"))   g_set.pollS = constrain(g_web.arg("poll").toInt(), MIN_POLL_S, MAX_POLL_S);
@@ -477,6 +658,8 @@ static void handleSave() {
     if (b.startsWith("https://")) g_set.fkBase = b;
     b = g_web.arg("etbase"); b.trim();
     if (b.startsWith("https://")) g_set.etBase = b;
+    b = g_web.arg("stbase"); b.trim();
+    if (b.startsWith("https://")) g_set.stBase = b;
     const bool changed = g_set.src != oldSrc || g_set.key() != oldKey || g_set.base() != oldBase;
     xSemaphoreGive(g_lock);
     saveSettings();
@@ -543,7 +726,8 @@ static uint32_t g_modeSaveAt = 0;
 static void onTap() {
     if (!g_set.tapCycles) return;
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (g_set.src == SRC_ETSY) g_set.etMode = (g_set.etMode + 1) % ET_COUNT;
+    if (g_set.src == SRC_ETSY)        g_set.etMode = (g_set.etMode + 1) % ET_COUNT;
+    else if (g_set.src == SRC_STATUS) g_set.stMode = (g_set.stMode + 1) % ST_COUNT;
     else                       g_set.fkMode = (g_set.fkMode + 1) % FK_COUNT;
     xSemaphoreGive(g_lock);
     renderView();
@@ -559,25 +743,25 @@ static void refreshScreenState() {
     String err, warn; uint32_t lastOk; bool have; String key;
     xSemaphoreTake(g_lock, portMAX_DELAY);
     err = g_err; warn = g_warn; lastOk = g_lastOkMs; key = g_set.key();
-    have = g_set.src == SRC_ETSY ? g_et.have : g_fk.have;
-    const bool etsy = g_set.src == SRC_ETSY;
+    have = g_set.src == SRC_ETSY ? g_et.have : g_set.src == SRC_STATUS ? g_st.have : g_fk.have;
+    const uint8_t src = g_set.src;
     xSemaphoreGive(g_lock);
 
     if (!g_netUp) {
-        ui_set_message("Set up WiFi", "On your phone, join\n" SETUP_AP_NAME "\nthen pick your network and paste your FairKeep API key or Etsy dial key.");
+        ui_set_message("Set up WiFi", "On your phone, join\n" SETUP_AP_NAME "\nthen pick your network and paste your dial key.");
         ui_set_status("", false);
         return;
     }
     if (key.isEmpty()) {
         String body = "Open http://" + WiFi.localIP().toString() + "/\non this WiFi and paste your " +
-                      (etsy ? "Etsy dial service key." : "FairKeep API key.");
+                      (src == SRC_ETSY ? "Etsy dial service key." : src == SRC_STATUS ? "status service key." : "FairKeep API key.");
         ui_set_message("Add key", body.c_str());
         ui_set_status("", false);
         return;
     }
     if (!have && err.length()) {
         String body = err + "\n\nSettings: http://" + WiFi.localIP().toString() + "/";
-        ui_set_message(etsy ? "Can't load Etsy" : "Can't load sales", body.c_str());
+        ui_set_message(src == SRC_ETSY ? "Can't load Etsy" : src == SRC_STATUS ? "Can't load status" : "Can't load sales", body.c_str());
         ui_set_status("", false);
         return;
     }

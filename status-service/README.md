@@ -22,7 +22,7 @@ Coolify reports status as `state:health` (`running:healthy`, `running:unknown`,
 
 | Variable | |
 |----------|---|
-| `SERVICE_KEY` | bearer key the dials send |
+| `SERVICE_KEY` | bearer key the dials send — start it with `st_` (e.g. `st_` + `openssl rand -hex 24`) so a dial set up from its hotspot knows it is a status key |
 | `HETZNER_TOKEN` | Hetzner Cloud API token — **Read** is enough |
 | `COOLIFY_INSTANCES` | `NAME=URL,NAME=URL`, e.g. `VAROAPPS-1=http://89.167.57.129:8000,VAROAPPS-2=http://coolify:8080` (an instance's own Coolify is reachable from its apps at `http://coolify:8080` on the `coolify` Docker network) |
 | `COOLIFY_TOKEN_<NAME>` | one API token per instance (upper-case, `-` → `_`), permission **read** |

@@ -18,7 +18,11 @@ desktop, a USB-C data cable, one click. No toolchain needed.
   API key with *Reports read* (Vendor plan). The numbers are the same ones as FairKeep's Live View.
 - **Etsy** — a shop's **Today / This month / This year**: orders and gross income, or the figure after
   Etsy fees (optionally after postage labels too). Reads an [Etsy dial service](etsy-service/) that holds
-  the shop's Etsy authorization.
+  the shop's Etsy authorization. A fourth view counts orders waiting to ship (amber when one is due
+  today, red when one is overdue).
+- **Server status** — every Coolify app, service and database, every domain and every Hetzner server,
+  one dot each round the edge, with what's broken listed underneath; a second view shows each server's
+  CPU. Reads a [status service](status-service/) you host with read-only tokens.
 
 On the dial: **tap** to change view (or lock a dial to one view), **press and hold** to refresh.
 Setup is from your phone: first boot opens a `FairKeepDial-Setup` WiFi hotspot where you pick your
@@ -31,6 +35,7 @@ network and paste a key. After that, everything lives on the dial's own settings
 |--------|------|
 | [`firmware/`](firmware/) | PlatformIO / Arduino firmware (LVGL 8) |
 | [`etsy-service/`](etsy-service/) | Small Python service that turns a shop's Etsy orders and ledger into dial numbers |
+| [`status-service/`](status-service/) | Small Python service that rolls Hetzner Cloud, Coolify and HTTPS checks into one status for the dials |
 | [`docs/`](docs/) | The browser installer, served by GitHub Pages at dial.varo.industries |
 
 ## Build it yourself

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sales Dial — install | VARO Desk Dials</title>
-<meta name="description" content="Browser installer for round ESP32-S3 AMOLED desk dials (Waveshare ESP32-S3-Touch-AMOLED-1.75): today's FairKeep sales or Etsy shop totals on your desk.">
+<meta name="description" content="Browser installer for round ESP32-S3 AMOLED desk dials (Waveshare ESP32-S3-Touch-AMOLED-1.75): today's FairKeep sales, Etsy shop totals and orders to ship, or the status of your Coolify and Hetzner servers on your desk.">
 <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
 <style>
   :root { --bg:#0b1424; --card:#131f35; --line:#1e2a40; --cream:#f4ebdd; --dim:#8a93a6; --gold:#f2a93b; --green:#4ade80; }
@@ -40,6 +40,9 @@
     <figure><img src="img/web.png" alt="Web view"><figcaption>Web only</figcaption></figure>
     <figure><img src="img/all.png" alt="All three view"><figcaption>All three</figcaption></figure>
     <figure><img src="img/etsy.png" alt="Etsy month view"><figcaption>Etsy &middot; month</figcaption></figure>
+    <figure><img src="img/ship.png" alt="Etsy to-ship view"><figcaption>Etsy &middot; to ship</figcaption></figure>
+    <figure id="status"><img src="img/status.png" alt="Server status view"><figcaption>Server status</figcaption></figure>
+    <figure><img src="img/servers.png" alt="Servers CPU view"><figcaption>Servers</figcaption></figure>
   </div>
 
   <div class="card">
@@ -51,6 +54,7 @@
       <li>Copy the key (it starts with <code>bb_live_</code>) &mdash; FairKeep only shows it once.</li>
     </ol>
     <p class="muted" style="margin-top:14px"><b>For Etsy:</b> the dial reads an Etsy dial service (the <code>etsy-service</code> folder in the repo), which holds the shop's Etsy authorization. Use that service's key; the dial switches to Etsy automatically when the key doesn't start with <code>bb_live_</code>, and you can set the service's address on the dial's settings page.</p>
+    <p class="muted" style="margin-top:14px"><b>For server status:</b> run the <code>status-service</code> folder from the repo with read-only Hetzner and Coolify tokens, and give it a key that starts with <code>st_</code> &mdash; that prefix is how the dial knows it's a status key. Set the service's address on the dial's settings page.</p>
   </div>
 
   <div class="card install">
@@ -77,7 +81,7 @@
   <div class="card">
     <h2>Using it</h2>
     <ol>
-      <li><b>Tap</b> the screen to switch views: FairKeep cycles Total &rarr; POS &rarr; Web &rarr; All three; Etsy cycles Today &rarr; Month &rarr; Year. Untick &ldquo;Tap the dial to change view&rdquo; on the settings page to lock a dial to one view.</li>
+      <li><b>Tap</b> the screen to switch views: FairKeep cycles Total &rarr; POS &rarr; Web &rarr; All three; Etsy cycles Today &rarr; Month &rarr; Year &rarr; To ship; Server status cycles Everything &rarr; Servers. Untick &ldquo;Tap the dial to change view&rdquo; on the settings page to lock a dial to one view.</li>
       <li><b>Press and hold</b> to refresh right away. Otherwise it refreshes every minute.</li>
       <li>FairKeep numbers match the Live View: every show on today's calendar plus Shopify web orders, using your POS sales basis from Settings.</li>
       <li>Etsy shows gross by default (items + shipping after discounts and refunds, without the sales tax Etsy collects). Tick &ldquo;Show after Etsy fees&rdquo; to subtract everything Etsy charged that period, and optionally postage labels too.</li>

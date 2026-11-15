@@ -25,7 +25,10 @@ View reduced to three numbers.
   "year":  { "label": "2026",       "orders": 473, "gross": 17613.58, "fees": 7217.61, "labels": 2873.60, "net": 10395.97 } }
 ```
 
-The setup hotspot takes either key: one starting `bb_live_` selects FairKeep, anything else Etsy.
+**Server status** — `GET <service>/status` from a [status service](../status-service/).
+
+The setup hotspot takes any of the keys: one starting `bb_live_` selects FairKeep, `st_` the status
+service, anything else Etsy.
 
 ## Settings page (`http://fairkeepdial.local/` or the dial's IP)
 
