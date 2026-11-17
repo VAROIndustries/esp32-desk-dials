@@ -1,11 +1,11 @@
 #pragma once
-// FairKeep Dial — board + app constants.
+// VARO Desk Dial — board + app constants.
 // Board: Waveshare ESP32-S3-Touch-AMOLED-1.75 (CO5300 466x466 QSPI AMOLED, CST9217 touch,
 // AXP2101 PMIC). Pin map taken from Capsule Radar (MIT, (c) 2026 Quique Tortosa), which
 // verified it against ESPHome, xiaozhi-esp32 and the Waveshare schematic.
 
-#define FW_NAME             "FairKeep Dial"
-#define FW_VERSION          "1.2.0"
+#define FW_NAME             "VARO Desk Dial"
+#define FW_VERSION          "1.2.1"
 #define BOARD_NAME          "ESP32-S3-Touch-AMOLED-1.75"
 
 #define SCREEN_W            466
@@ -47,5 +47,5 @@
 #define MIN_POLL_S          30
 #define MAX_POLL_S          900
 #define DEFAULT_BRIGHTNESS  200
-#define SETUP_AP_NAME       "FairKeepDial-Setup"
-#define MDNS_HOST           "fairkeepdial"   // -> http://fairkeepdial.local/
+#define SETUP_AP_NAME       "DeskDial-Setup"
+#define MDNS_HOST           "deskdial"   // -> http://deskdial.local/

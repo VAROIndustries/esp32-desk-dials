@@ -30,7 +30,7 @@ View reduced to three numbers.
 The setup hotspot takes any of the keys: one starting `bb_live_` selects FairKeep, `st_` the status
 service, anything else Etsy.
 
-## Settings page (`http://fairkeepdial.local/` or the dial's IP)
+## Settings page (`http://deskdial.local/` or the dial's IP)
 
 Data source, keys and URLs per source, view, *Tap the dial to change view* (untick to lock it),
 show cents, *after Etsy fees* / *after postage labels*, refresh interval, brightness, firmware upload,

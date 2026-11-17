@@ -1,5 +1,5 @@
 /**
- * FairKeep Dial — LVGL v8.x configuration (based on Capsule Radar's, MIT).
+ * VARO Desk Dial — LVGL v8.x configuration (based on Capsule Radar's, MIT).
  * Reached via -DLV_CONF_INCLUDE_SIMPLE (LVGL does #include "lv_conf.h").
  * Only the settings we care about are listed; everything else falls back to the
  * library defaults in lv_conf_internal.h. Tuned for the CO5300 466x466 AMOLED.

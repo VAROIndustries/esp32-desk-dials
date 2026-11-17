@@ -1,4 +1,4 @@
-// FairKeep Dial — sales on a round desk display.
+// VARO Desk Dial — sales on a round desk display.
 //
 // Two data sources:
 //   FairKeep  GET {fkBase}/device/today   (bb_live_ API key, Reports read)
@@ -6,8 +6,8 @@
 //   Etsy      GET {etBase}/summary        (Etsy dial service key, see etsy-service/)
 //             views: Today / Month / Year; gross by default, optionally after Etsy fees
 //             (and optionally after postage labels too)
-// Setup: first boot opens the FairKeepDial-Setup hotspot (WiFi + key). Afterwards
-// everything is on http://fairkeepdial.local/ (or the dial's IP).
+// Setup: first boot opens the DeskDial-Setup hotspot (WiFi + key). Afterwards
+// everything is on http://deskdial.local/ (or the dial's IP).
 // Touch: tap = next view (unless the view is locked), long-press = refresh now.
 #include <Arduino.h>
 #include <WiFi.h>
@@ -57,7 +57,7 @@ static Preferences g_prefs;
 // NVS keys "apikey", "apibase", "mode" are the FairKeep ones from v1.0 — kept so a
 // dial updated over the air keeps its setup.
 static void loadSettings() {
-    g_prefs.begin("fkdial", true);
+    g_prefs.begin("fkdial", true);   // namespace kept from the FairKeep Dial days so updates keep settings
     g_set.src      = g_prefs.getUChar("src", SRC_FAIRKEEP);
     if (g_set.src >= SRC_COUNT) g_set.src = SRC_FAIRKEEP;
     g_set.fkKey    = g_prefs.getString("apikey", "");
@@ -527,7 +527,7 @@ static String htmlEscape(const String &s) {
 
 static const char PAGE_HEAD[] PROGMEM =
     "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>FairKeep Dial</title><style>"
+    "<title>VARO Desk Dial</title><style>"
     "body{font-family:system-ui,sans-serif;background:#0b1424;color:#f4ebdd;margin:0;padding:24px;max-width:560px}"
     "h1{color:#f2a93b;font-size:22px;margin:0 0 4px}h2{color:#f2a93b;font-size:16px;margin:0 0 4px}.sub{color:#8a93a6;font-size:13px;margin:0 0 20px}"
     ".card{background:#131f35;border:1px solid #1e2a40;border-radius:12px;padding:16px;margin:0 0 16px}"
@@ -579,7 +579,7 @@ static void handleRoot() {
     static const char *stNames[ST_COUNT] = { "Everything", "Servers (CPU)" };
 
     String p = FPSTR(PAGE_HEAD);
-    p += "<h1>FairKeep Dial</h1><p class=sub>" FW_VERSION " &middot; " + WiFi.localIP().toString() + " &middot; " + htmlEscape(WiFi.SSID()) + "</p>";
+    p += "<h1>VARO Desk Dial</h1><p class=sub>" FW_VERSION " &middot; " + WiFi.localIP().toString() + " &middot; " + htmlEscape(WiFi.SSID()) + "</p>";
     p += "<div class=card>" + status + "</div>";
     p += "<form method=POST action=/save>";
 
@@ -627,7 +627,7 @@ static void handleRoot() {
 
 static void sendBack(const char *msg) {
     String p = FPSTR(PAGE_HEAD);
-    p += "<h1>FairKeep Dial</h1><div class=card>";
+    p += "<h1>VARO Desk Dial</h1><div class=card>";
     p += msg;
     p += "</div><p><a style='color:#f2a93b' href='/'>Back</a></p><script>setTimeout(()=>location='/',1500)</script></body></html>";
     g_web.send(200, "text/html", p);
@@ -799,7 +799,7 @@ void setup() {
     ui_create(onTap, onLongPress);
     ui_set_cents(g_set.cents);
     renderView();
-    ui_set_message("FairKeep Dial", "Connecting to WiFi...");
+    ui_set_message("VARO Desk Dial", "Connecting to WiFi...");
     display::loop();
 
     // Setup hotspot: non-blocking so the screen keeps drawing while it is open.

@@ -1,4 +1,4 @@
-// FairKeep Dial — CO5300 QSPI AMOLED + LVGL 8 + CST9217 touch.
+// VARO Desk Dial — CO5300 QSPI AMOLED + LVGL 8 + CST9217 touch.
 // A trimmed-down version of Capsule Radar's display.cpp (MIT, (c) 2026 Quique Tortosa):
 // same panel bring-up, 2-px-aligned flush windows and internal-RAM draw buffer, without
 // the radar sweep compositor or arbitrary rotation.

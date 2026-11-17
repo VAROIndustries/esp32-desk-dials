@@ -1,4 +1,4 @@
-// FairKeep Dial — round 466x466 UI (LVGL 8).
+// VARO Desk Dial — round 466x466 UI (LVGL 8).
 #include "ui.h"
 #include "config.h"
 #include <lvgl.h>

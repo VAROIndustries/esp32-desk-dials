@@ -1,13 +1,13 @@
 {
-  "name": "FairKeep Dial",
-  "version": "1.2.0",
+  "name": "VARO Desk Dial",
+  "version": "1.2.1",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32-S3",
       "parts": [
         {
-          "path": "FairKeepDial-esp32s3.bin",
+          "path": "VARODeskDial-esp32s3.bin",
           "offset": 0
         }
       ]

@@ -25,9 +25,9 @@ desktop, a USB-C data cable, one click. No toolchain needed.
   CPU. Reads a [status service](status-service/) you host with read-only tokens.
 
 On the dial: **tap** to change view (or lock a dial to one view), **press and hold** to refresh.
-Setup is from your phone: first boot opens a `FairKeepDial-Setup` WiFi hotspot where you pick your
+Setup is from your phone: first boot opens a `DeskDial-Setup` WiFi hotspot where you pick your
 network and paste a key. After that, everything lives on the dial's own settings page
-(`http://fairkeepdial.local/`).
+(`http://deskdial.local/`).
 
 ## Repository layout
 
@@ -46,7 +46,7 @@ pio run -t upload                 # build + flash over USB
 python tools/make_release.py      # rebuild docs/ (installer image + OTA image + manifest)
 ```
 
-Updates can also be uploaded from the dial's settings page (`FairKeepDial-ota.bin`).
+Updates can also be uploaded from the dial's settings page (`VARODeskDial-ota.bin`).
 
 ## Credits and licenses
 
