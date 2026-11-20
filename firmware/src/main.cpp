@@ -20,6 +20,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <mbedtls/base64.h>
+#include <esp_random.h>
 
 #include "config.h"
 #include "certs.h"
@@ -48,6 +50,7 @@ struct Settings {
     uint16_t pollS = DEFAULT_POLL_S;
     bool     cents = false;
     uint8_t  bright = DEFAULT_BRIGHTNESS;
+    String   pin;                // web settings page PIN (6 digits, made up on first boot)
     bool     cycleOn = false;    // step through the views by itself
     uint8_t  cycleS = 15;        // ...every this many seconds
 
@@ -78,6 +81,7 @@ static void loadSettings() {
     g_set.pollS    = constrain(g_prefs.getUShort("poll", DEFAULT_POLL_S), MIN_POLL_S, MAX_POLL_S);
     g_set.cents    = g_prefs.getBool("cents", false);
     g_set.bright   = constrain(g_prefs.getUChar("bright", DEFAULT_BRIGHTNESS), 10, 255);
+    g_set.pin      = g_prefs.getString("pin", "");
     g_set.cycleOn  = g_prefs.getBool("cycle", false);
     g_set.cycleS   = constrain(g_prefs.getUChar("cycles", 15), 5, 120);
     g_prefs.end();
@@ -101,6 +105,7 @@ static void saveSettings() {
     g_prefs.putUShort("poll", g_set.pollS);
     g_prefs.putBool("cents", g_set.cents);
     g_prefs.putUChar("bright", g_set.bright);
+    g_prefs.putString("pin", g_set.pin);
     g_prefs.putBool("cycle", g_set.cycleOn);
     g_prefs.putUChar("cycles", g_set.cycleS);
     g_prefs.end();
@@ -567,7 +572,50 @@ static String checkbox(const char *name, bool on, const char *text) {
     return String("<label class=c><input type=checkbox name=") + name + " value=1" + (on ? " checked" : "") + ">" + text + "</label>";
 }
 
+// ------------------------------------------------------------------ web PIN
+// HTTP Basic auth: any username, the PIN as the password. Five wrong tries lock the
+// page for 30 s so a 6-digit PIN can't be walked through quickly.
+static uint8_t  g_authFails = 0;
+static uint32_t g_authLockUntil = 0;
+
+static bool pinOk() {
+    if (g_set.pin.isEmpty()) return true;
+    if (g_authLockUntil && (int32_t)(g_authLockUntil - millis()) > 0) return false;
+    String h = g_web.header("Authorization");
+    bool ok = false;
+    if (h.startsWith("Basic ")) {
+        h = h.substring(6); h.trim();
+        unsigned char out[96]; size_t n = 0;
+        if (mbedtls_base64_decode(out, sizeof(out) - 1, &n, (const unsigned char *)h.c_str(), h.length()) == 0) {
+            out[n] = 0;
+            const char *colon = strchr((const char *)out, ':');
+            if (colon) {
+                const char *given = colon + 1;
+                const String &want = g_set.pin;
+                const size_t gl = strlen(given), wl = want.length();
+                uint8_t diff = gl != wl;                       // compare every byte, no early exit
+                for (size_t i = 0; i < wl; ++i) diff |= (uint8_t)((i < gl ? given[i] : 0) ^ want[i]);
+                ok = diff == 0;
+            }
+        }
+        if (!ok && ++g_authFails >= 5) { g_authFails = 0; g_authLockUntil = millis() + 30000; }
+        if (ok) g_authFails = 0;
+    }
+    return ok;
+}
+
+// true = carry on; false = a 401 has been sent
+static bool requirePin() {
+    if (pinOk()) return true;
+    g_web.sendHeader("WWW-Authenticate", "Basic realm=\"VARO Desk Dial - enter the dial's PIN (any username)\"");
+    g_web.send(401, "text/html", String(FPSTR(PAGE_HEAD)) +
+               "<h1>VARO Desk Dial</h1><div class=card>PIN needed. Press and hold the dial to see its PIN "
+               "(any username; the PIN is the password).</div></body></html>");
+    return false;
+}
+
 static void handleRoot() {
+    if (!requirePin()) return;
     String err, warn; uint32_t lastOk;
     xSemaphoreTake(g_lock, portMAX_DELAY);
     err = g_err; warn = g_warn; lastOk = g_lastOkMs;
@@ -634,13 +682,17 @@ static void handleRoot() {
     p += "<label>Brightness</label><input type=range name=bright min=10 max=255 value=" + String(s.bright) + ">";
     p += "<button>Save</button></div></form>";
 
+    p += "<form method=POST action=/pin><div class=card><b>Settings PIN</b>"
+         "<p class=sub style='margin:6px 0 0'>This page asks for it. The dial shows it too: press and hold the dial.</p>"
+         "<label>New PIN (4&ndash;8 digits)</label><input name=pin inputmode=numeric pattern='[0-9]{4,8}' required>"
+         "<button class=sec>Change PIN</button></div></form>";
     p += "<form method=POST action=/refresh><button class=sec>Refresh now</button></form>";
     p += "<div class=card style='margin-top:16px'><b>Firmware update</b>"
          "<form method=POST action=/update enctype=multipart/form-data>"
          "<input type=file name=fw accept=.bin style='margin-top:10px'><button class=sec>Upload .bin</button></form></div>";
     p += "<form method=POST action=/wifi onsubmit=\"return confirm('Forget WiFi and reopen the setup hotspot?')\">"
          "<button class=sec>Reset WiFi</button></form>";
-    p += "<p class=sub>On the dial: tap to change view, press and hold to refresh.</p></body></html>";
+    p += "<p class=sub>On the dial: tap to change view, press and hold for its settings screen.</p></body></html>";
     g_web.send(200, "text/html", p);
 }
 
@@ -653,6 +705,7 @@ static void sendBack(const char *msg) {
 }
 
 static void handleSave() {
+    if (!requirePin()) return;
     if (crossSite()) { g_web.send(403, "text/plain", "cross-site request rejected"); return; }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     const uint8_t oldSrc = g_set.src;
@@ -693,13 +746,29 @@ static void handleSave() {
     sendBack("Saved.");
 }
 
+static void handlePin() {
+    if (!requirePin()) return;
+    if (crossSite()) { g_web.send(403, "text/plain", "cross-site request rejected"); return; }
+    String n = g_web.arg("pin"); n.trim();
+    bool digits = n.length() >= 4 && n.length() <= 8;
+    for (char c : n) if (c < '0' || c > '9') digits = false;
+    if (!digits) { sendBack("PIN not changed: use 4 to 8 digits."); return; }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_set.pin = n;
+    xSemaphoreGive(g_lock);
+    saveSettings();
+    sendBack("PIN changed. Your browser will ask for the new one.");
+}
+
 static void handleRefresh() {
+    if (!requirePin()) return;
     if (crossSite()) { g_web.send(403, "text/plain", "cross-site request rejected"); return; }
     g_fetchNow = true;
     sendBack("Refreshing&hellip;");
 }
 
 static void handleWifiReset() {
+    if (!requirePin()) return;
     if (crossSite()) { g_web.send(403, "text/plain", "cross-site request rejected"); return; }
     sendBack("WiFi forgotten. Join <b>" SETUP_AP_NAME "</b> to set it up again.");
     delay(500);
@@ -709,6 +778,7 @@ static void handleWifiReset() {
 
 static bool g_updateOk = false;
 static void handleUpdateDone() {
+    if (!requirePin()) return;
     if (!g_updateOk) { g_web.send(400, "text/plain", "Update failed: " + String(Update.errorString())); return; }
     sendBack("Update installed. Restarting&hellip;");
     delay(800);
@@ -718,7 +788,7 @@ static void handleUpdateUpload() {
     HTTPUpload &up = g_web.upload();
     if (up.status == UPLOAD_FILE_START) {
         g_updateOk = false;
-        if (crossSite()) return;
+        if (crossSite() || !pinOk()) return;
         ui_set_message("Updating", "Installing new firmware...");
         Update.begin(UPDATE_SIZE_UNKNOWN);
     } else if (up.status == UPLOAD_FILE_WRITE) {
@@ -730,10 +800,11 @@ static void handleUpdateUpload() {
 }
 
 static void startWeb() {
-    static const char *hdrs[] = { "Origin" };
-    g_web.collectHeaders(hdrs, 1);
+    static const char *hdrs[] = { "Origin", "Authorization" };
+    g_web.collectHeaders(hdrs, 2);
     g_web.on("/", HTTP_GET, handleRoot);
     g_web.on("/save", HTTP_POST, handleSave);
+    g_web.on("/pin", HTTP_POST, handlePin);
     g_web.on("/refresh", HTTP_POST, handleRefresh);
     g_web.on("/wifi", HTTP_POST, handleWifiReset);
     g_web.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
@@ -782,7 +853,7 @@ static void showMenu() {
         strlcpy(m.wifi, "setup hotspot: " SETUP_AP_NAME, sizeof(m.wifi));
     }
     static const char *srcShort[SRC_COUNT] = { "FairKeep", "Etsy", "Server status" };
-    snprintf(m.line, sizeof(m.line), "v" FW_VERSION "  -  %s", srcShort[g_set.src]);
+    snprintf(m.line, sizeof(m.line), "v" FW_VERSION "  -  %s  -  PIN %s", srcShort[g_set.src], g_set.pin.c_str());
     m.brightPct = (g_set.bright * 100 + 127) / 255;
     m.cycleSec = g_set.cycleOn ? g_set.cycleS : 0;
     ui_menu_show(m);
@@ -887,6 +958,12 @@ void setup() {
     Serial.println("\n[" FW_NAME " " FW_VERSION "] boot");
     g_lock = xSemaphoreCreateMutex();
     loadSettings();
+    if (g_set.pin.isEmpty()) {      // first boot on 1.3.1+: make up this dial's PIN
+        char b[8];
+        snprintf(b, sizeof(b), "%06lu", (unsigned long)(esp_random() % 1000000UL));
+        g_set.pin = b;
+        saveSettings();
+    }
     g_dataSrc = g_set.src;
 
     if (!display::begin()) Serial.println("[boot] display failed");

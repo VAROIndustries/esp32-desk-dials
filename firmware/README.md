@@ -39,6 +39,14 @@ service, anything else Etsy.
 - **Auto-cycle**: steps through the current source's views on its own, every 5 s – 2 min
   (set on the settings page; switched on/off from either place).
 
+## Settings PIN
+
+Each dial makes up a 6-digit PIN on its first start (1.3.1+). The web settings page, and
+everything it does (save, refresh, Reset WiFi, firmware upload), asks for it: any username,
+the PIN as the password. The dial shows its PIN on its own settings screen (press and hold),
+and you can change it on the web page (4–8 digits). Five wrong tries lock the page for 30 s.
+Over-the-air update from a script: `curl -u dial:<PIN> -F fw=@VARODeskDial-ota.bin http://<ip>/update`.
+
 ## Settings page (`http://deskdial.local/` or the dial's IP)
 
 Data source, keys and URLs per source, view, *Tap the dial to change view* (untick to lock it),

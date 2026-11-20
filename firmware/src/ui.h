@@ -33,7 +33,7 @@ void ui_set_battery(int percent, bool charging, bool present);
 struct MenuInfo {
     char ip[24]    = "";        // "192.168.1.50"
     char wifi[33]  = "";        // SSID
-    char line[48]  = "";        // "v1.3.0  -  Etsy"
+    char line[64]  = "";        // "v1.3.1  -  Etsy  -  PIN 123456"
     int  brightPct = 50;        // 4..100
     int  cycleSec  = 0;         // 0 = auto-cycle off
 };
