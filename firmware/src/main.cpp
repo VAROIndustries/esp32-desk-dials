@@ -8,7 +8,8 @@
 //             (and optionally after postage labels too)
 // Setup: first boot opens the DeskDial-Setup hotspot (WiFi + key). Afterwards
 // everything is on http://deskdial.local/ (or the dial's IP).
-// Touch: tap = next view (unless the view is locked), long-press = refresh now.
+// Touch: tap = next view (unless the view is locked), long-press = settings screen
+// (IP, brightness, auto-cycle, refresh, screen off). With the screen off, a tap wakes it.
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
@@ -47,6 +48,8 @@ struct Settings {
     uint16_t pollS = DEFAULT_POLL_S;
     bool     cents = false;
     uint8_t  bright = DEFAULT_BRIGHTNESS;
+    bool     cycleOn = false;    // step through the views by itself
+    uint8_t  cycleS = 15;        // ...every this many seconds
 
     const String &key() const  { return src == SRC_ETSY ? etKey : src == SRC_STATUS ? stKey : fkKey; }
     const String &base() const { return src == SRC_ETSY ? etBase : src == SRC_STATUS ? stBase : fkBase; }
@@ -75,6 +78,8 @@ static void loadSettings() {
     g_set.pollS    = constrain(g_prefs.getUShort("poll", DEFAULT_POLL_S), MIN_POLL_S, MAX_POLL_S);
     g_set.cents    = g_prefs.getBool("cents", false);
     g_set.bright   = constrain(g_prefs.getUChar("bright", DEFAULT_BRIGHTNESS), 10, 255);
+    g_set.cycleOn  = g_prefs.getBool("cycle", false);
+    g_set.cycleS   = constrain(g_prefs.getUChar("cycles", 15), 5, 120);
     g_prefs.end();
 }
 
@@ -96,6 +101,8 @@ static void saveSettings() {
     g_prefs.putUShort("poll", g_set.pollS);
     g_prefs.putBool("cents", g_set.cents);
     g_prefs.putUChar("bright", g_set.bright);
+    g_prefs.putBool("cycle", g_set.cycleOn);
+    g_prefs.putUChar("cycles", g_set.cycleS);
     g_prefs.end();
 }
 
@@ -142,6 +149,8 @@ static FkData            g_fk;
 static EtData            g_et;
 static StData            g_st;
 static bool              g_dirty = true;
+static bool              g_screenOff = false;    // dimmed to black from the settings screen; a tap wakes it
+static uint32_t          g_lastCycle = 0;
 static String            g_err;            // last error, "" = last fetch ok
 static String            g_warn;           // non-fatal note from the server (e.g. Etsy sync delayed)
 static uint32_t          g_lastOkMs = 0;
@@ -477,7 +486,7 @@ static ViewData buildView() {
 static void renderView() {
     xSemaphoreTake(g_lock, portMAX_DELAY);
     ViewData v = buildView();
-    const int count = !g_set.tapCycles ? 0 : g_set.src == SRC_ETSY ? (int)ET_COUNT
+    const int count = !(g_set.tapCycles || g_set.cycleOn) ? 0 : g_set.src == SRC_ETSY ? (int)ET_COUNT
                     : g_set.src == SRC_STATUS ? (int)ST_COUNT : (int)FK_COUNT;
     const int active = g_set.src == SRC_ETSY ? g_set.etMode : g_set.src == SRC_STATUS ? g_set.stMode : g_set.fkMode;
     xSemaphoreGive(g_lock);
@@ -585,6 +594,16 @@ static void handleRoot() {
 
     p += "<div class=card><label>Show</label><select name=src>" + options(srcNames, SRC_COUNT, s.src) + "</select>";
     p += checkbox("tap", s.tapCycles, "Tap the dial to change view (untick to lock it to the view below)");
+    p += checkbox("cycle", s.cycleOn, "Cycle through the views by itself");
+    {
+        static const uint8_t secs[] = { 5, 10, 15, 20, 30, 45, 60, 120 };
+        p += "<label>Change view every</label><select name=cycles>";
+        for (uint8_t v : secs)
+            p += "<option value=" + String(v) + (v == s.cycleS ? " selected" : "") + ">" +
+                 (v < 60 ? String(v) + " seconds" : v == 60 ? String("1 minute") : String("2 minutes")) + "</option>";
+        p += "</select>";
+    }
+    p += "<p class=sub style='margin:6px 0 0'>On the dial: press and hold for its settings screen (IP address, brightness, auto-cycle, screen off).</p>";
     p += checkbox("cents", s.cents, "Show cents") + "</div>";
 
     p += "<div class=card><h2>FairKeep</h2>";
@@ -652,6 +671,8 @@ static void handleSave() {
     if (g_web.hasArg("bright")) g_set.bright = constrain(g_web.arg("bright").toInt(), 10, 255);
     g_set.cents     = g_web.hasArg("cents");
     g_set.tapCycles = g_web.hasArg("tap");
+    g_set.cycleOn   = g_web.hasArg("cycle");
+    if (g_web.hasArg("cycles")) g_set.cycleS = constrain(g_web.arg("cycles").toInt(), 5, 120);
     g_set.etNet     = g_web.hasArg("etnet");
     g_set.etLabels  = g_web.hasArg("etlbl");
     String b = g_web.arg("fkbase"); b.trim();
@@ -665,7 +686,8 @@ static void handleSave() {
     saveSettings();
     if (changed) resetData();
     ui_set_cents(g_set.cents);
-    display::setBrightness(g_set.bright);
+    if (!g_screenOff) display::setBrightness(g_set.bright);
+    g_lastCycle = millis();
     renderView();
     g_fetchNow = true;
     sendBack("Saved.");
@@ -723,19 +745,93 @@ static void startWeb() {
 
 // ------------------------------------------------------------------ touch actions
 static uint32_t g_modeSaveAt = 0;
-static void onTap() {
-    if (!g_set.tapCycles) return;
+
+static void nextView() {
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_set.src == SRC_ETSY)        g_set.etMode = (g_set.etMode + 1) % ET_COUNT;
     else if (g_set.src == SRC_STATUS) g_set.stMode = (g_set.stMode + 1) % ST_COUNT;
-    else                       g_set.fkMode = (g_set.fkMode + 1) % FK_COUNT;
+    else                              g_set.fkMode = (g_set.fkMode + 1) % FK_COUNT;
     xSemaphoreGive(g_lock);
     renderView();
+}
+
+static void screenOn() {
+    g_screenOff = false;
+    display::setBrightness(g_set.bright);
+    g_lastCycle = millis();
+}
+
+static void onTap() {
+    if (g_screenOff) { screenOn(); return; }
+    if (!g_set.tapCycles) return;
+    nextView();
+    g_lastCycle = millis();             // a tap restarts the auto-cycle clock
     g_modeSaveAt = millis() + 3000;     // save once the taps settle
 }
+
+// ---- settings screen ----
+static const uint8_t BRIGHT_STEPS[] = { 10, 26, 51, 82, 128, 179, 255 };
+static uint32_t g_menuAt = 0;           // last interaction; closes itself after 30 s
+
+static void showMenu() {
+    MenuInfo m;
+    if (g_netUp) {
+        strlcpy(m.ip, WiFi.localIP().toString().c_str(), sizeof(m.ip));
+        strlcpy(m.wifi, WiFi.SSID().c_str(), sizeof(m.wifi));
+    } else {
+        strlcpy(m.wifi, "setup hotspot: " SETUP_AP_NAME, sizeof(m.wifi));
+    }
+    static const char *srcShort[SRC_COUNT] = { "FairKeep", "Etsy", "Server status" };
+    snprintf(m.line, sizeof(m.line), "v" FW_VERSION "  -  %s", srcShort[g_set.src]);
+    m.brightPct = (g_set.bright * 100 + 127) / 255;
+    m.cycleSec = g_set.cycleOn ? g_set.cycleS : 0;
+    ui_menu_show(m);
+    g_menuAt = millis();
+}
+
+static void onMenu(int action) {
+    g_menuAt = millis();
+    switch (action) {
+    case MA_BRIGHT_DOWN:
+    case MA_BRIGHT_UP: {
+        int i = 0;
+        while (i < (int)sizeof(BRIGHT_STEPS) - 1 && BRIGHT_STEPS[i] < g_set.bright) ++i;
+        if (action == MA_BRIGHT_UP)   i = BRIGHT_STEPS[i] > g_set.bright ? i : i + 1;
+        else                          i = i - 1;
+        i = constrain(i, 0, (int)sizeof(BRIGHT_STEPS) - 1);
+        g_set.bright = BRIGHT_STEPS[i];
+        display::setBrightness(g_set.bright);
+        g_modeSaveAt = millis() + 3000;
+        showMenu();
+        break;
+    }
+    case MA_CYCLE:
+        g_set.cycleOn = !g_set.cycleOn;
+        g_lastCycle = millis();
+        g_modeSaveAt = millis() + 1000;
+        renderView();
+        showMenu();
+        break;
+    case MA_REFRESH:
+        g_fetchNow = true;
+        ui_menu_hide();
+        ui_set_status("refreshing...", false);
+        break;
+    case MA_SCREEN_OFF:
+        ui_menu_hide();
+        g_screenOff = true;
+        display::setBrightness(0);
+        break;
+    case MA_DONE:
+    default:
+        ui_menu_hide();
+        break;
+    }
+}
+
 static void onLongPress() {
-    g_fetchNow = true;
-    ui_set_status("refreshing...", false);
+    if (g_screenOff) { screenOn(); return; }
+    showMenu();
 }
 
 // ------------------------------------------------------------------ status line
@@ -797,6 +893,7 @@ void setup() {
     battery_begin();
     display::setBrightness(g_set.bright);
     ui_create(onTap, onLongPress);
+    ui_menu_set_callback(onMenu);
     ui_set_cents(g_set.cents);
     renderView();
     ui_set_message("VARO Desk Dial", "Connecting to WiFi...");
@@ -858,6 +955,15 @@ void loop() {
     }
 
     if (g_modeSaveAt && (int32_t)(millis() - g_modeSaveAt) >= 0) { g_modeSaveAt = 0; saveSettings(); }
+
+    if (ui_menu_open() && millis() - g_menuAt > 30000) ui_menu_hide();
+
+    // Auto-cycle: step to the next view on its own (not saved, so the flash isn't worn).
+    if (g_set.cycleOn && !g_screenOff && !ui_menu_open() &&
+        millis() - g_lastCycle >= (uint32_t)g_set.cycleS * 1000) {
+        g_lastCycle = millis();
+        nextView();
+    }
 
     delay(5);
 }

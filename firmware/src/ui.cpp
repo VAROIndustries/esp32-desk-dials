@@ -206,6 +206,90 @@ static void scr_event_cb(lv_event_t *e) {
     else if (code == LV_EVENT_LONG_PRESSED && s_onLong) s_onLong();
 }
 
+// ---------- settings menu ----------
+static lv_obj_t *s_menu = nullptr, *s_mIp, *s_mWifi, *s_mLine, *s_mBright, *s_mCycle;
+static void (*s_menuCb)(int) = nullptr;
+
+static void menu_btn_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_menuCb) return;
+    s_menuCb((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+static lv_obj_t *mk_btn(lv_obj_t *parent, int w, int h, int x, int y, const char *txt, int action,
+                        lv_color_t fg = C_CREAM, const lv_font_t *f = &lv_font_montserrat_20) {
+    lv_obj_t *b = lv_obj_create(parent);
+    lv_obj_set_size(b, w, h);
+    lv_obj_align(b, LV_ALIGN_CENTER, x, y);
+    lv_obj_set_style_radius(b, h / 2, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x131F35), 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x2A3A58), LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(b, C_RING, 0);
+    lv_obj_set_style_border_width(b, 2, 0);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(b, menu_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)action);
+    lv_obj_t *l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, f, 0);
+    lv_obj_set_style_text_color(l, fg, 0);
+    lv_label_set_text(l, txt);
+    lv_obj_center(l);
+    return l;
+}
+
+static lv_obj_t *mk_menu_label(const lv_font_t *f, lv_color_t c, int y) {
+    lv_obj_t *l = lv_label_create(s_menu);
+    lv_obj_set_style_text_font(l, f, 0);
+    lv_obj_set_style_text_color(l, c, 0);
+    lv_obj_align(l, LV_ALIGN_CENTER, 0, y);
+    return l;
+}
+
+static void menu_build() {
+    s_menu = lv_obj_create(s_scr);
+    lv_obj_set_size(s_menu, SCREEN_W, SCREEN_H);
+    lv_obj_center(s_menu);
+    lv_obj_set_style_radius(s_menu, 0, 0);
+    lv_obj_set_style_border_width(s_menu, 0, 0);
+    lv_obj_set_style_pad_all(s_menu, 0, 0);
+    lv_obj_set_style_bg_color(s_menu, C_BG, 0);
+    lv_obj_set_style_bg_opa(s_menu, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_menu, LV_OBJ_FLAG_SCROLLABLE);   // clickable: swallows taps meant for the dial
+
+    lv_obj_t *t = mk_menu_label(&lv_font_montserrat_20, C_MARIGOLD, -178);
+    lv_obj_set_style_text_letter_space(t, 2, 0);
+    lv_label_set_text(t, "SETTINGS");
+    s_mIp   = mk_menu_label(&lv_font_montserrat_28, C_CREAM, -138);
+    s_mWifi = mk_menu_label(&lv_font_montserrat_16, C_DIM, -106);
+    s_mLine = mk_menu_label(&lv_font_montserrat_16, C_DIM, -84);
+
+    mk_btn(s_menu, 64, 52, -128, -34, "-", MA_BRIGHT_DOWN, C_CREAM, &lv_font_montserrat_28);
+    mk_btn(s_menu, 64, 52,  128, -34, "+", MA_BRIGHT_UP, C_CREAM, &lv_font_montserrat_28);
+    s_mBright = mk_menu_label(&lv_font_montserrat_20, C_CREAM, -34);
+
+    s_mCycle = mk_btn(s_menu, 300, 52, 0, 28, "", MA_CYCLE);
+    mk_btn(s_menu, 300, 52, 0, 88, "Refresh now", MA_REFRESH);
+    mk_btn(s_menu, 140, 52, -76, 148, "Screen off", MA_SCREEN_OFF, C_DIM, &lv_font_montserrat_16);
+    mk_btn(s_menu, 140, 52,  76, 148, "Done", MA_DONE, C_MARIGOLD);
+}
+
+void ui_menu_set_callback(void (*cb)(int)) { s_menuCb = cb; }
+
+void ui_menu_show(const MenuInfo &m) {
+    if (!s_menu) menu_build();
+    lv_label_set_text(s_mIp, m.ip[0] ? m.ip : "not on WiFi");
+    lv_label_set_text(s_mWifi, m.wifi);
+    lv_label_set_text(s_mLine, m.line);
+    lv_label_set_text_fmt(s_mBright, "Brightness %d%%", m.brightPct);
+    if (m.cycleSec > 0) lv_label_set_text_fmt(s_mCycle, "Auto-cycle: every %ds", m.cycleSec);
+    else                lv_label_set_text(s_mCycle, "Auto-cycle: off");
+    lv_obj_set_style_text_color(s_mCycle, m.cycleSec > 0 ? C_GREEN : C_CREAM, 0);
+    lv_obj_clear_flag(s_menu, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_menu);
+}
+
+void ui_menu_hide() { if (s_menu) lv_obj_add_flag(s_menu, LV_OBJ_FLAG_HIDDEN); }
+bool ui_menu_open() { return s_menu && !lv_obj_has_flag(s_menu, LV_OBJ_FLAG_HIDDEN); }
+
 // ---------- public ----------
 void ui_create(void (*onTap)(), void (*onLongPress)()) {
     s_onTap = onTap;

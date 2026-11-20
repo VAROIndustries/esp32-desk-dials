@@ -30,6 +30,15 @@ View reduced to three numbers.
 The setup hotspot takes any of the keys: one starting `bb_live_` selects FairKeep, `st_` the status
 service, anything else Etsy.
 
+## On the dial
+
+- **Tap**: next view (unless locked on the settings page).
+- **Press and hold**: settings screen with the dial's IP address and WiFi, firmware version,
+  brightness (– / +), auto-cycle on/off, refresh now, and screen off. A tap wakes a dark screen.
+  It closes itself after 30 seconds.
+- **Auto-cycle**: steps through the current source's views on its own, every 5 s – 2 min
+  (set on the settings page; switched on/off from either place).
+
 ## Settings page (`http://deskdial.local/` or the dial's IP)
 
 Data source, keys and URLs per source, view, *Tap the dial to change view* (untick to lock it),
