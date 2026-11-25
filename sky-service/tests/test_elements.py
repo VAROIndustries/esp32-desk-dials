@@ -115,6 +115,14 @@ def test_omm_intl_is_valid_or_empty(oid, want):
     assert got[0].intl == want
 
 
+def test_omm_intl_is_ascii_only():
+    arabic = "\u0661\u0669\u0669\u0668-\u0660\u0666\u0667A"
+    got = E.parse_omm_json(json.dumps([omm(1, OBJECT_ID=arabic), omm(2, OBJECT_ID="1998-067A")]).encode())
+    assert got[0].intl == ""
+    assert got[1].intl == "1998-067A"
+    assert all(e.intl.isascii() for e in got)
+
+
 def test_tle_checksum_rejects_overlong_lines():
     assert not E.tle_checksum_ok(ISS_L1 + "5")
     assert not E.tle_checksum_ok(ISS_L1 + "123456")

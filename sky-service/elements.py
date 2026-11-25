@@ -47,7 +47,7 @@ def epoch_unix(sat: Satrec) -> float:
 
 MIN_REV_DAY = 0.05               # below this the "orbit" is not a satellite orbit
 _PROBE_DAYS = (0.0, 0.25)        # propagate here at load time; sgp4 flags failures only when propagating
-_INTL = re.compile(r"\d{4}-\d{3}[A-Z]{1,3}")
+_INTL = re.compile(r"[0-9]{4}-[0-9]{3}[A-Z]{1,3}")
 
 
 def _sane(sat: Satrec) -> bool:
