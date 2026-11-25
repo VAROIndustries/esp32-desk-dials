@@ -1,6 +1,6 @@
 """Parse and validate downloaded orbital elements before the service uses them.
 
-Two formats: CelesTrak GP data as OMM JSON, and classic TLE text (hobbyist file).
+Two formats: CelesTrak GP data as OMM JSON, and classic TLE text (an extra TLE file).
 Anything that fails validation raises ElementError; the caller keeps its last good copy.
 """
 from __future__ import annotations
