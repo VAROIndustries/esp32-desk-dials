@@ -314,7 +314,23 @@ def test_key_guesses_on_health_are_rate_limited_like_sky(tmp_path):
     assert codes == [200, 200, 429]
     status, body, _ = app.handle("/health", {"authorization": "Bearer " + "k" * 24}, "9.9.9.9")
     assert status == 429 and "sources" not in body              # over the limit: the key is not even checked
-    assert app.handle("/health", {}, "9.9.9.9")[0] == 200       # the plain health check is never limited
+    assert app.handle("/health", {}, "9.9.9.9")[0] == 429       # the plain health check is charged too
+
+
+def test_plain_health_is_charged_to_the_address_limit_but_loopback_is_exempt(tmp_path):
+    app, here, _ = _app(tmp_path, {"RATE_PER_MIN": "2"})
+    status = [app.handle("/health", {}, "9.9.9.9") for _ in range(3)]
+    assert [s[0] for s in status] == [200, 200, 429] and status[2][1] == {"error": "slow down", "poll": 300}
+    assert status[2][2]["Retry-After"] == "60" and "sources" not in status[2][1]
+    sky = f"/v1/sky?{here}&screens=nasa"
+    assert [app.handle(p, {}, "8.8.8.8")[0] for p in (sky, "/health", sky)] == [200, 200, 429]   # one budget
+    for ip in ("127.0.0.1", "::1"):                              # the container health check
+        assert [app.handle("/health", {}, ip)[0] for _ in range(10)] == [200] * 10
+    assert [app.handle(sky, {}, "127.0.0.1")[0] for _ in range(3)] == [200, 200, 429]   # loopback /health cost nothing
+    edge, _, _ = _app(tmp_path, {"RATE_PER_MIN": "1", "ORIGIN_SECRET": EDGE})
+    assert [edge.handle("/health", {}, "127.0.0.1")[0] for _ in range(3)] == [200] * 3
+    ok = {"x-origin-auth": EDGE, "cf-connecting-ip": "7.7.7.7"}
+    assert [edge.handle("/health", ok, "10.0.0.1")[0] for _ in range(2)] == [200, 429]
 
 
 def test_worst_case_reply_fits_the_size_cap(tmp_path):
@@ -361,7 +377,8 @@ def test_tick_once_ticks_and_survives_errors(capsys):
         def tick(self, now):
             raise RuntimeError("boom")
     A.tick_once(Broken(), T0)                                  # does not raise
-    assert "[sky] background error: RuntimeError: boom" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "[sky] background error: RuntimeError\n" in out and "boom" not in out      # type only
 
 
 def test_fetch_once_downloads_at_most_one_source_per_minute_most_overdue_first(tmp_path):
@@ -409,7 +426,8 @@ def test_fetch_once_survives_errors(capsys):
         def due(self, now):
             raise OSError("disk gone")
     A.fetch_once(A.new_fetch_state(), Engine(), Broken(), {}, False, T0)
-    assert "[sky] background error: OSError: disk gone" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "[sky] background error: OSError\n" in out and "disk gone" not in out      # type only
 
 
 def test_rebuild_uses_the_oldest_fetch_and_treats_never_fetched_as_unknown(tmp_path):

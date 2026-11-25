@@ -247,10 +247,12 @@ class App:
         age = self.engine.tick_age(now)
         stalled = age > STALE_TICK_S
         if path == "/health":
+            # Charged to the per-address limit like every route (one budget, no separate one);
+            # only the container health check (loopback, no key) is exempt.
+            if (not local_health or headers.get("authorization")) and not self.limiter.allow_key(ip):
+                return SLOW_DOWN
             trusted = False                            # only the key unlocks the full body
-            if headers.get("authorization"):           # a key check here is charged like on /v1/sky
-                if not self.limiter.allow_key(ip):
-                    return SLOW_DOWN
+            if headers.get("authorization"):
                 key = self._key(headers, ip)
                 if key == "throttled":
                     return SLOW_DOWN
@@ -504,7 +506,7 @@ def rebuild(engine, store, env, hobby_on, now):
 
 
 def _log_error(e):
-    print(f"[sky] background error: {type(e).__name__}: {e}", flush=True)
+    print(f"[sky] background error: {type(e).__name__}", flush=True)      # type only, never the message
 
 
 def tick_once(engine, now):
@@ -602,7 +604,7 @@ def main():
                      name="sky-fetcher", daemon=True).start()
     port = int(env.get("PORT", "8080"))
     print(f"[sky] listening on :{port}; spy screen {'on' if env.get('SKY_SPY_KEY') else 'off'}, "
-          f"hobbyist source {'on' if hobby_on else 'off'}", flush=True)
+          f"extra source {'on' if hobby_on else 'off'}", flush=True)
     SkyServer(("0.0.0.0", port), make_handler(App(engine, store, env))).serve_forever()
 
 
