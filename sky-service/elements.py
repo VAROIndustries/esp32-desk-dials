@@ -1,13 +1,16 @@
 """Parse and validate downloaded orbital elements before the service uses them.
 
-Two formats: CelesTrak GP data as OMM JSON, and classic TLE text (an extra TLE file).
+Two formats: CelesTrak GP data as OMM JSON, and classic TLE text (an extra TLE file, which may
+arrive as a zip archive holding that text).
 Anything that fails validation raises ElementError; the caller keeps its last good copy.
 """
 from __future__ import annotations
 
+import io
 import json
 import math
 import re
+import zipfile
 from dataclasses import dataclass
 
 from sgp4 import omm
@@ -15,6 +18,7 @@ from sgp4.api import Satrec
 
 MAX_BYTES = 8 * 1024 * 1024      # largest file accepted (Starlink JSON is a few MB)
 MAX_OBJECTS = 20000
+MAX_ZIP_MEMBERS = 16
 MAX_BAD_FRACTION = 0.10          # more broken records than this -> reject the whole file
 NAME_LEN = 24
 _NAME_OK = re.compile(r"[^A-Z0-9 ()+./-]")
@@ -114,6 +118,46 @@ def tle_checksum_ok(line: str) -> bool:
         return False
     total = sum(int(ch) if ch.isdigit() else (1 if ch == "-" else 0) for ch in line[:68])
     return total % 10 == int(line[68])
+
+
+def unzip_tle(raw: bytes) -> bytes:
+    """Zip archive body -> the bytes of its one TLE member, read in memory only.
+
+    Nothing is extracted or written to disk; member names are never used as paths and never appear in
+    an error message (they are chosen by whoever made the archive). Every failure is an ElementError.
+    """
+    if len(raw) > MAX_BYTES:
+        raise ElementError("file too large")
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except Exception:
+        raise ElementError("not a zip archive") from None
+    with zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_ZIP_MEMBERS:
+            raise ElementError("too many members")
+        if any(i.flag_bits & 0x1 for i in infos):
+            raise ElementError("encrypted member")
+        files = [i for i in infos if not i.is_dir()]
+        tles = [i for i in files if i.filename.lower().endswith((".tle", ".txt"))]
+        if len(tles) > 1:
+            raise ElementError("more than one TLE member")
+        if tles:
+            member = tles[0]
+        elif len(files) == 1:
+            member = files[0]
+        else:
+            raise ElementError("no TLE member")
+        if member.file_size > MAX_BYTES:            # declared size: early reject only, never trusted
+            raise ElementError("member too large")
+        try:
+            with zf.open(member) as f:
+                data = f.read(MAX_BYTES + 1)
+        except Exception:
+            raise ElementError("unreadable zip member") from None
+    if len(data) > MAX_BYTES:
+        raise ElementError("member too large")
+    return data
 
 
 def parse_tle_text(raw: bytes) -> list:

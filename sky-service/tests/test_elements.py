@@ -178,3 +178,52 @@ def test_tle_orphan_element_line_never_becomes_a_name():
 def test_tle_stray_text_within_ten_percent_is_tolerated():
     got = E.parse_tle_text((f"{ISS_L1}\n{ISS_L2}\n" * 20 + "stray words\nmore words\n").encode())
     assert len(got) == 20
+
+
+
+# ---- zip archives (extra TLE file published zipped) ------------------------------------
+import io
+import zipfile
+
+ISS_TLE = f"ISS (ZARYA)\n{ISS_L1}\n{ISS_L2}\n".encode()
+
+
+def _zip(members):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in members:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_unzip_tle_single_tle_member_parses():
+    got = E.unzip_tle(_zip([("extra.tle", ISS_TLE)]))
+    assert got == ISS_TLE
+    assert [(e.name, e.satnum) for e in E.parse_tle_text(got)] == [("ISS (ZARYA)", 25544)]
+
+
+def test_unzip_tle_rejects_non_zips_and_truncated_zips():
+    full = _zip([("x.tle", ISS_TLE * 20)])
+    for raw in (b"not a zip at all", b"PK\x03\x04garbage after the magic", full[: len(full) // 2]):
+        with pytest.raises(E.ElementError):
+            E.unzip_tle(raw)
+
+
+def test_unzip_tle_two_tle_members_are_rejected():
+    with pytest.raises(E.ElementError, match="more than one"):
+        E.unzip_tle(_zip([("a.tle", ISS_TLE), ("b.txt", ISS_TLE)]))
+
+
+def test_unzip_tle_decompression_bomb_is_rejected():
+    bomb = _zip([("x.tle", b"\x00" * (E.MAX_BYTES + 1))])
+    assert len(bomb) < 64 * 1024
+    with pytest.raises(E.ElementError, match="member too large"):
+        E.unzip_tle(bomb)
+
+
+def test_unzip_tle_error_messages_never_contain_member_names():
+    for members in ([("SECRETNAME.html", b"x"), ("SECRETNAME2.html", b"y")],
+                    [("SECRETNAME.tle", ISS_TLE), ("SECRETNAME.txt", ISS_TLE)]):
+        with pytest.raises(E.ElementError) as ei:
+            E.unzip_tle(_zip(members))
+        assert "SECRET" not in str(ei.value)

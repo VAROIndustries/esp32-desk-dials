@@ -130,7 +130,11 @@ class Store:
         return os.path.join(self.dir, name + ext)
 
     def _parse(self, src, raw):
-        return elements.parse_omm_json(raw) if src.kind == "omm" else elements.parse_tle_text(raw)
+        if src.kind == "omm":
+            return elements.parse_omm_json(raw)
+        if raw.startswith((b"PK\x03\x04", b"PK\x05\x06")):     # a zip archive (detected by content)
+            return elements.parse_tle_text(elements.unzip_tle(raw))
+        return elements.parse_tle_text(raw)
 
     # --- disk ---------------------------------------------------------------------------------
 

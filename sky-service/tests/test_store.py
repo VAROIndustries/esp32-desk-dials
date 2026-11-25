@@ -778,3 +778,34 @@ def test_reap_survives_close_attributes_that_raise_on_lookup():
     store_mod._reap(Hostile(), Session())     # does not raise; the session is still closed
     assert closed == ["session"]
     store_mod._reap(None, Hostile())          # a hostile session is tolerated too
+
+
+# --- the extra TLE file may be published as a zip archive -------------------------------
+
+def _zip_body(members):
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in members:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def _tle_store(tmp_path, http):
+    src = Source("extra", "https://example.test/extra.zip", "tle", 24 * 3600)
+    return Store(str(tmp_path), [src], http, "UA", log=lambda m: None), src
+
+
+def test_zipped_tle_is_accepted_persisted_raw_and_reloaded(tmp_path):
+    from conftest import ISS_L1, ISS_L2
+    body = _zip_body([("feed.tle", f"ISS\n{ISS_L1}\n{ISS_L2}\n".encode())])
+    store, src = _tle_store(tmp_path, FakeHttp([(200, body)]))
+    assert store.refresh(src, 1000.0) is True
+    assert [(e.name, e.satnum) for e in src.elems] == [("ISS", 25544)] and src.last == "ok, 1 objects"
+    head, _, saved = (tmp_path / "extra.dat").read_bytes().partition(b"\n")
+    assert saved == body and json.loads(head)["bytes"] == len(body)
+    fresh, src2 = _tle_store(tmp_path, FakeHttp([]))
+    fresh.load_disk(now=1001.0)
+    assert [(e.name, e.satnum) for e in src2.elems] == [("ISS", 25544)] and src2.fetched_at == 1000.0
+
