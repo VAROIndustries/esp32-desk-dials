@@ -4,6 +4,8 @@ Edit NASA_IDS to change the NASA screen without touching the dial firmware.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 # NORAD catalogue numbers. Verify any new entry against CelesTrak's SATCAT before adding.
 NASA_IDS = {
     25544: "ISS",
@@ -35,11 +37,11 @@ GROUPS = {
     "resource": "resource",
     "military": "military",
 }
-HOBBY_SOURCE = "hobby"           # TLE text from SPY_HOBBY_URL, once a day, optional proxy
+HOBBY_SOURCE = "hobby"           # extra TLE file (SPY_HOBBY_URL), once a day
 
 # An orbit measured long ago predicts badly. These are judgement calls, not a standard.
 MAX_EPOCH_AGE_S = 30 * 86400          # official lists: older than this is left out
-MAX_HOBBY_EPOCH_AGE_S = 60 * 86400    # hobbyist list: observed less often, kept longer
+MAX_HOBBY_EPOCH_AGE_S = 60 * 86400    # extra TLE file: updated less often, kept longer
 MAX_FUTURE_EPOCH_S = 86400            # an orbit dated more than a day ahead is bogus
 
 
@@ -48,38 +50,49 @@ def build_screens(sources: dict, spy_enabled: bool, hobby_enabled: bool, now: fl
 
     Returns (screens, dropped): screens is screen name -> (list[Elem], list[str] tags), with
     empty screens left out; dropped is source name -> number of objects left out as too old
-    or dated in the future.
+    or dated in the future (for the NASA sources, only objects listed in NASA_IDS count).
+    An object found in more than one source of a screen appears once, at its first place and
+    with its first tag, using whichever copy has the newer element set.
     """
     dropped = {}
 
-    def fresh(src, limit=MAX_EPOCH_AGE_S):
+    def fresh(src, limit=MAX_EPOCH_AGE_S, wanted=None):
         elems = sources.get(src) or []
+        if elems:
+            dropped[src] = 0
+        if wanted is not None:
+            elems = [e for e in elems if e.satnum in wanted]
         keep = [e for e in elems if -MAX_FUTURE_EPOCH_S <= now - e.epoch <= limit]
         if elems:
             dropped[src] = len(elems) - len(keep)
         return keep
 
+    def merge(groups):
+        """[(elems, tag), ...] -> (elems, tags): one entry per object, the newer copy wins."""
+        pos, out, tags = {}, [], []
+        for elems, tag in groups:
+            for e in elems:
+                i = pos.get(e.satnum)
+                if i is None:
+                    pos[e.satnum] = len(out)
+                    out.append(e)
+                    tags.append(tag)
+                elif e.epoch > out[i].epoch:
+                    out[i] = e
+        return out, tags
+
     out = {}
     s = fresh("starlink")
     if s:
         out["starlink"] = (s, [""] * len(s))
-    nasa, seen = [], set()
-    for src in ("stations", "science", "resource"):
-        for e in fresh(src):
-            if e.satnum in NASA_IDS and e.satnum not in seen:
-                seen.add(e.satnum)
-                nasa.append(type(e)(NASA_IDS[e.satnum], e.satnum, e.sat, e.intl, e.epoch))
+    nasa, _ = merge((fresh(src, wanted=NASA_IDS), "") for src in ("stations", "science", "resource"))
+    nasa = [replace(e, name=NASA_IDS[e.satnum]) for e in nasa]
     if nasa:
         out["nasa"] = (nasa, [""] * len(nasa))
     if spy_enabled:
-        spy, tags, seen = [], [], set()
-        if hobby_enabled:
-            for e in fresh(HOBBY_SOURCE, MAX_HOBBY_EPOCH_AGE_S):
-                if e.satnum not in seen:
-                    seen.add(e.satnum); spy.append(e); tags.append("HOBBY")
-        for e in fresh("military"):
-            if e.satnum not in seen:
-                seen.add(e.satnum); spy.append(e); tags.append("MIL")
+        groups = [(fresh(HOBBY_SOURCE, MAX_HOBBY_EPOCH_AGE_S), "HOBBY")] if hobby_enabled else []
+        groups.append((fresh("military"), "MIL"))
+        spy, tags = merge(groups)
         if spy:
             out["spy"] = (spy, tags)
     return out, dropped
