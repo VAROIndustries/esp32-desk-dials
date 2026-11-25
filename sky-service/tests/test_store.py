@@ -317,21 +317,29 @@ def test_store_refuses_duplicate_names(tmp_path):
         Store(str(tmp_path), [a, b], FakeHttp([]), "UA", log=lambda m: None)
 
 
-# --- Findings 3-5: requests_get ---
+# --- Findings 3-5 and round 2: requests_get ---
 
 class FakeRaw:
-    def __init__(self, chunks, clock=None, step=0.0):
-        self.chunks, self.clock, self.step = list(chunks), clock, step
+    """A response body. read() honours amt, like a real stream; every request is recorded."""
 
-    def read1(self, amt=None, decode_content=None):
-        if self.clock is not None:
-            self.clock[0] += self.step
-        return self.chunks.pop(0) if self.chunks else b""
+    def __init__(self, chunks):
+        self.chunks, self.reads = list(chunks), []
+
+    def read(self, amt=None, decode_content=None):
+        self.reads.append((amt, decode_content))
+        if not self.chunks:
+            return b""
+        c = self.chunks.pop(0)
+        if amt is not None and len(c) > amt:
+            c, rest = c[:amt], c[amt:]
+            self.chunks.insert(0, rest)
+        return c
 
 
 class FakeResponse:
-    def __init__(self, status, raw):
+    def __init__(self, status, raw, headers=None):
         self.status_code, self.raw, self.closed = status, raw, False
+        self.headers = dict(headers or {})
 
     def close(self):
         self.closed = True
@@ -340,12 +348,15 @@ class FakeResponse:
 class FakeSession:
     instances = []
 
-    def __init__(self, response=None):
+    def __init__(self, response=None, block=None):
         self.trust_env, self.response, self.calls, self.closed = True, response, [], False
+        self.block = block
         FakeSession.instances.append(self)
 
     def get(self, url, **kw):
         self.calls.append((url, dict(kw), self.trust_env))
+        if self.block is not None:          # connect / TLS / headers that never finish in time
+            self.block.wait(5)
         return self.response
 
     def close(self):
@@ -361,11 +372,11 @@ class FakeSession:
 @pytest.fixture
 def fake_session(monkeypatch):
     import requests
-    holder = {}
+    holder = {"block": None}
     FakeSession.instances = []
 
     def make():
-        return FakeSession(holder["response"])
+        return FakeSession(holder["response"], holder["block"])
 
     def no_network(*a, **k):
         raise AssertionError("a test tried to use the network")
@@ -375,15 +386,47 @@ def fake_session(monkeypatch):
     return holder
 
 
+@pytest.fixture
+def jobs(monkeypatch):
+    """Every download job started, so a test can see what an abandoned worker did. Releases them at the end."""
+    import threading
+    started, releases = [], []
+
+    class Recorded(store_mod._Download):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            started.append(self)
+
+    monkeypatch.setattr(store_mod, "_Download", Recorded)
+    monkeypatch.setattr(store_mod, "TOTAL_TIMEOUT_S", 0.2)
+    yield started, releases
+    for r in releases:
+        r()
+    for t in threading.enumerate():
+        if t.name == "store-download":
+            t.join(2)
+            assert not t.is_alive(), "a download worker was left running"
+
+
 def test_requests_get_settings_without_proxy(fake_session):
     fake_session["response"] = FakeResponse(200, FakeRaw([b"ab", b"c"]))
-    assert store_mod.requests_get("https://x.test/a", {"User-Agent": "UA"}, None, 60) == (200, b"abc")
+    given = {"User-Agent": "UA"}
+    assert store_mod.requests_get("https://x.test/a", given, None, 60) == (200, b"abc")
     s = FakeSession.instances[0]
     url, kw, trust_env = s.calls[0]
     assert url == "https://x.test/a" and trust_env is False
     assert kw["allow_redirects"] is False and kw["verify"] is True and kw["stream"] is True
-    assert kw["proxies"] == {} and kw["headers"] == {"User-Agent": "UA"}
+    assert kw["proxies"] == {} and kw["headers"] == {"User-Agent": "UA", "Accept-Encoding": "identity"}
+    assert given == {"User-Agent": "UA"}                       # the caller's dict is not changed
     assert fake_session["response"].closed and s.closed
+    assert all(dc is False for _, dc in fake_session["response"].raw.reads)   # never asks urllib3 to decode
+
+
+def test_requests_get_always_asks_for_an_uncompressed_body(fake_session):
+    fake_session["response"] = FakeResponse(200, FakeRaw([b"x"]))
+    store_mod.requests_get("https://x.test/a", {"accept-encoding": "gzip", "User-Agent": "UA"}, None, 60)
+    _, kw, _ = FakeSession.instances[0].calls[0]
+    assert kw["headers"] == {"User-Agent": "UA", "Accept-Encoding": "identity"}
 
 
 def test_requests_get_settings_with_proxy(fake_session):
@@ -406,12 +449,28 @@ def test_requests_get_refuses_plain_http(fake_session):
     assert FakeSession.instances == [] or FakeSession.instances[0].calls == []
 
 
+@pytest.mark.parametrize("enc", ["gzip", "deflate", "br", "GZIP", "identity, gzip"])
+def test_requests_get_refuses_an_encoded_body(fake_session, enc):
+    fake_session["response"] = FakeResponse(200, FakeRaw([b"\x1f\x8b..."]), {"Content-Encoding": enc})
+    with pytest.raises(store_mod.DownloadError):
+        store_mod.requests_get("https://x.test/a", {}, None, 60)
+    assert fake_session["response"].closed and fake_session["response"].raw.reads == []
+
+
+@pytest.mark.parametrize("enc", ["identity", "Identity", ""])
+def test_requests_get_accepts_identity_encoding(fake_session, enc):
+    fake_session["response"] = FakeResponse(200, FakeRaw([b"ok"]), {"Content-Encoding": enc})
+    assert store_mod.requests_get("https://x.test/a", {}, None, 60) == (200, b"ok")
+
+
 def test_requests_get_size_cap(fake_session, monkeypatch):
     monkeypatch.setattr(elements, "MAX_BYTES", 10)
-    fake_session["response"] = FakeResponse(200, FakeRaw([b"123456", b"78901", b"never read"]))
+    fake_session["response"] = FakeResponse(200, FakeRaw([b"123456", b"78901234", b"never read"]))
     with pytest.raises(store_mod.DownloadTooLarge):
         store_mod.requests_get("https://x.test/a", {}, None, 60)
-    assert fake_session["response"].closed and fake_session["response"].raw.chunks == [b"never read"]
+    raw = fake_session["response"].raw
+    assert fake_session["response"].closed and raw.chunks == [b"234", b"never read"]
+    assert [amt for amt, _ in raw.reads] == [11, 5]           # never asks for more than cap + 1 - held
 
 
 def test_requests_get_exactly_at_cap_is_accepted(fake_session, monkeypatch):
@@ -420,14 +479,68 @@ def test_requests_get_exactly_at_cap_is_accepted(fake_session, monkeypatch):
     assert store_mod.requests_get("https://x.test/a", {}, None, 60) == (200, b"1234567890")
 
 
-def test_requests_get_total_deadline(fake_session, monkeypatch):
-    clock = [0.0]
-    monkeypatch.setattr(store_mod, "_clock", lambda: clock[0])
-    fake_session["response"] = FakeResponse(200, FakeRaw([b"a"] * 1000, clock=clock, step=50.0))
+def test_requests_get_worker_errors_reach_the_caller(fake_session):
+    class Broken(FakeRaw):
+        def read(self, amt=None, decode_content=None):
+            raise ConnectionResetError("peer at https://x.test/a went away")
+
+    fake_session["response"] = FakeResponse(200, Broken([]))
+    with pytest.raises(ConnectionResetError):
+        store_mod.requests_get("https://x.test/a", {}, None, 60)
+    assert fake_session["response"].closed
+
+
+def test_requests_get_connect_or_headers_that_never_finish_time_out(fake_session, jobs):
+    import threading
+    import time
+    started, releases = jobs
+    block = threading.Event()
+    releases.append(block.set)
+    fake_session["block"] = block
+    late = FakeResponse(200, FakeRaw([b"late data"]))
+    fake_session["response"] = late
+    t0 = time.monotonic()
     with pytest.raises(store_mod.DownloadTimeout):
         store_mod.requests_get("https://x.test/a", {}, None, 60)
-    raw = fake_session["response"].raw
-    assert fake_session["response"].closed and len(raw.chunks) >= 1000 - 3
+    assert time.monotonic() - t0 < 0.2 + 0.3
+    assert FakeSession.instances[0].closed                    # the session was closed to unblock the worker
+    block.set()                                               # now the headers arrive, too late
+    started[0].thread.join(2)
+    assert not started[0].thread.is_alive()
+    assert late.closed and late.raw.reads == []               # the late response is closed, nothing read
+    assert started[0].result is None and started[0].error is None and not started[0].finished.is_set()
+
+
+def test_requests_get_body_that_stops_arriving_times_out(fake_session, jobs):
+    import socket
+    import time
+    started, releases = jobs
+    ours, theirs = socket.socketpair()
+    releases.append(ours.close)
+    releases.append(theirs.close)
+    theirs.sendall(b"first part ")
+
+    class SocketBody:
+        """A body read from a real (local) socket whose sender goes quiet."""
+
+        def __init__(self, sock):
+            self.connection = type("Conn", (), {"sock": sock})()
+            self.reads = []
+
+        def read(self, amt=None, decode_content=None):
+            self.reads.append(amt)
+            return self.connection.sock.recv(amt)
+
+    resp = FakeResponse(200, SocketBody(ours))
+    fake_session["response"] = resp
+    t0 = time.monotonic()
+    with pytest.raises(store_mod.DownloadTimeout):
+        store_mod.requests_get("https://x.test/a", {}, None, 60)
+    assert time.monotonic() - t0 < 0.2 + 0.3
+    started[0].thread.join(2)                                 # shutting the socket down released the read
+    assert not started[0].thread.is_alive()
+    assert resp.closed and len(resp.raw.reads) == 2
+    assert started[0].result is None and started[0].error is None and not started[0].finished.is_set()
 
 
 def test_requests_get_timeouts_never_exceed_the_total(fake_session):
@@ -437,7 +550,48 @@ def test_requests_get_timeouts_never_exceed_the_total(fake_session):
     assert max(kw["timeout"]) <= store_mod.TOTAL_TIMEOUT_S
 
 
+def test_store_user_agent_is_sent_through_requests_get(tmp_path, fake_session):
+    fake_session["response"] = FakeResponse(200, FakeRaw([GOOD]))
+    store, src = _store(tmp_path, store_mod.requests_get)
+    assert store.refresh(src, 0.0) is True
+    _, kw, _ = FakeSession.instances[0].calls[0]
+    assert kw["headers"]["User-Agent"] == "UA/1 (me@example.test)" and kw["proxies"] == {}
+
+
 def test_download_errors_back_off_as_network_errors(tmp_path):
     store, src = _store(tmp_path, FakeHttp([store_mod.DownloadTooLarge()]))
     assert store.refresh(src, 0.0) is False and src.last == "network error: DownloadTooLarge"
     assert src.next_try == BACKOFF_MIN_S
+
+
+# --- Round 2 minor items ---
+
+def test_data_newer_than_the_state_file_reads_loaded_from_disk(tmp_path):
+    # Crash after the data write, before the state write: the old state still says "HTTP 403".
+    (tmp_path / "stations.dat").write_bytes(_dat(9000.0, GOOD))
+    (tmp_path / "stations.state.json").write_text(json.dumps(
+        {"fetched_at": 100.0, "next_try": 9000.0 + BACKOFF_MIN_S, "backoff": 3600, "last": "HTTP 403",
+         "last_attempt": 9000.0}))
+    store, src = _store(tmp_path, FakeHttp([]))
+    store.load_disk(now=9010.0)
+    assert src.last == "loaded from disk" and src.backoff == 0
+
+
+def test_data_not_newer_than_the_state_file_keeps_its_status(tmp_path):
+    (tmp_path / "stations.dat").write_bytes(_dat(100.0, GOOD))
+    (tmp_path / "stations.state.json").write_text(json.dumps(
+        {"fetched_at": 100.0, "next_try": 9000.0 + BACKOFF_MIN_S, "backoff": 3600, "last": "HTTP 403",
+         "last_attempt": 9000.0}))
+    store, src = _store(tmp_path, FakeHttp([]))
+    store.load_disk(now=9010.0)
+    assert src.last == "HTTP 403" and src.backoff == 3600
+
+
+@pytest.mark.parametrize("interval", [0, 60, BACKOFF_MIN_S - 1, -7200, float("nan"), float("inf"), "7200", None, True])
+def test_interval_below_the_hourly_minimum_is_refused(interval):
+    with pytest.raises(ValueError):
+        Source("ok", "https://example.test/x", "omm", interval)
+
+
+def test_interval_of_exactly_one_hour_is_allowed():
+    assert Source("ok", "https://example.test/x", "omm", BACKOFF_MIN_S).interval_s == BACKOFF_MIN_S

@@ -28,7 +28,9 @@ import json
 import math
 import os
 import re
+import socket
 import tempfile
+import threading
 import time
 
 import elements
@@ -38,13 +40,13 @@ HOBBY_INTERVAL_S = 24 * 3600
 BACKOFF_MIN_S = 3600
 BACKOFF_MAX_S = 24 * 3600
 TIMEOUT_S = 60                       # connect timeout, and the longest wait for any single read
-TOTAL_TIMEOUT_S = 120                # the whole download: connect + every read
+TOTAL_TIMEOUT_S = 120                # the whole download (DNS, connect, TLS, headers, body), enforced by
+                                     # waiting for a worker thread at most this long
 CLOCK_SKEW_S = 300                   # saved times later than now + this are not believed
 _CHUNK = 64 * 1024
 _STATE_MAX = 4096                    # a state file larger than this is corrupt
 _HEADER_MAX = 1024
 _NAME = re.compile(r"[a-z0-9_-]{1,32}")
-_clock = time.monotonic              # replaced in tests
 
 
 class DownloadError(Exception):
@@ -57,6 +59,10 @@ class DownloadTooLarge(DownloadError):
 
 class DownloadTimeout(DownloadError):
     pass
+
+
+class DownloadEncoded(DownloadError):
+    """The server sent a compressed body although identity was asked for."""
 
 
 class Source:
@@ -74,6 +80,9 @@ class Source:
             raise ValueError("source name must match [a-z0-9_-]{1,32}")
         if not isinstance(url, str) or not url.startswith("https://"):
             raise ValueError("source URL must start with https://")
+        iv = _finite(interval_s)
+        if iv is None or iv < BACKOFF_MIN_S:      # never more than one request per hour per source
+            raise ValueError("source interval must be a finite number of seconds >= BACKOFF_MIN_S")
         self.name, self.url, self.kind, self.interval_s, self.proxy = name, url, kind, interval_s, proxy
         self.elems = []
         self.fetched_at = None
@@ -213,7 +222,10 @@ class Store:
                 src.elems, raw_t = data
                 data_fetched = _past(raw_t, now)
                 src.fetched_at = data_fetched
-                if st is None or src.last.startswith("ok") or src.last == "never fetched":
+                # The data file is newer than the schedule (a crash between the two writes): the saved
+                # status describes an older attempt, so it no longer applies.
+                newer = data_fetched is not None and st is not None and (st_fetched is None or data_fetched > st_fetched)
+                if st is None or newer or src.last.startswith("ok") or src.last == "never fetched":
                     src.last = "loaded from disk"
                 # The data file is newer than the last attempt record: that attempt succeeded.
                 if data_fetched is not None and st_attempt is not None and data_fetched >= st_attempt:
@@ -289,45 +301,114 @@ class Store:
 def requests_get(url, headers, proxy, timeout):
     """GET one https URL. Returns (status, body); the body is read only for a 200.
 
-    No redirects, no proxy or credentials from the environment, TLS verified. Raises DownloadTooLarge
-    past elements.MAX_BYTES and DownloadTimeout past TOTAL_TIMEOUT_S; the response is always closed.
+    No redirects, no proxy or credentials from the environment, TLS verified, body requested
+    uncompressed (a Content-Encoding other than identity is refused). The download runs in a daemon
+    worker thread; the caller gets control back within TOTAL_TIMEOUT_S whatever the network does (DNS,
+    connect, TLS, headers, chunk framing, body), with DownloadTimeout. An abandoned worker is told to
+    stop, its response and session are closed, and its result is thrown away. Raises DownloadTooLarge
+    past elements.MAX_BYTES (never more than MAX_BYTES + 1 bytes are held); the response is always closed.
     """
-    import requests
     if not isinstance(url, str) or not url.startswith("https://"):
         raise ValueError("only https URLs are fetched")
-    deadline = _clock() + TOTAL_TIMEOUT_S
-    t = min(timeout, TOTAL_TIMEOUT_S)
-    with requests.Session() as s:
-        s.trust_env = False
-        r = s.get(url, headers=headers, timeout=(t, t), proxies={"https": proxy} if proxy else {},
-                  allow_redirects=False, verify=True, stream=True)
+    job = _Download(url, headers, proxy, min(timeout, TOTAL_TIMEOUT_S))
+    job.thread.start()
+    if not job.finished.wait(TOTAL_TIMEOUT_S) and job.abandon():
+        raise DownloadTimeout()
+    if job.error is not None:
+        raise job.error
+    return job.result
+
+
+class _Download:
+    """One download in a daemon thread. Hands its outcome over only if the caller is still waiting."""
+
+    def __init__(self, url, headers, proxy, read_timeout):
+        self.url, self.proxy, self.t = url, proxy, read_timeout
+        self.headers = {k: v for k, v in (headers or {}).items() if k.lower() != "accept-encoding"}
+        self.headers["Accept-Encoding"] = "identity"
+        self.lock = threading.Lock()
+        self.finished = threading.Event()
+        self.abandoned = False
+        self.session = self.response = None
+        self.result = self.error = None
+        self.thread = threading.Thread(target=self._run, name="store-download", daemon=True)
+
+    def _run(self):
         try:
-            if r.status_code != 200:
-                return r.status_code, b""
-            buf = bytearray()
-            while True:
-                left = deadline - _clock()
-                if left <= 0:
-                    raise DownloadTimeout()
-                _limit_next_read(r, min(t, left))
-                chunk = r.raw.read1(_CHUNK, decode_content=True)
-                if not chunk:
-                    break
-                buf += chunk
-                if len(buf) > elements.MAX_BYTES:
-                    raise DownloadTooLarge()
-            if _clock() > deadline:
+            res, err = self._fetch(), None
+        except BaseException as e:      # handed to the caller; never escapes the thread
+            res, err = None, e
+        with self.lock:
+            if self.abandoned:
+                return                  # too late: nobody gets this result
+            self.result, self.error = res, err
+            self.finished.set()
+
+    def abandon(self) -> bool:
+        """Give up on the download. False if it finished first (its outcome then stands)."""
+        with self.lock:
+            if self.finished.is_set():
+                return False
+            self.abandoned = True
+            r, s = self.response, self.session
+        if r is not None:
+            _shutdown_socket(r)
+            _close_quietly(r)
+        if s is not None:
+            _close_quietly(s)
+        return True
+
+    def _keep(self, attr, obj):
+        """Record the session / response so abandon() can close it; stop at once if already abandoned."""
+        with self.lock:
+            setattr(self, attr, obj)
+            if self.abandoned:
                 raise DownloadTimeout()
-            return 200, bytes(buf)
-        finally:
-            r.close()
+
+    def _fetch(self):
+        import requests
+        with requests.Session() as s:
+            s.trust_env = False
+            self._keep("session", s)
+            r = s.get(self.url, headers=self.headers, timeout=(self.t, self.t),
+                      proxies={"https": self.proxy} if self.proxy else {},
+                      allow_redirects=False, verify=True, stream=True)
+            try:
+                self._keep("response", r)
+                if r.status_code != 200:
+                    return r.status_code, b""
+                enc = (r.headers.get("Content-Encoding") or "identity").strip().lower()
+                if enc != "identity":
+                    raise DownloadEncoded()
+                buf = bytearray()
+                while True:
+                    if self.abandoned:
+                        raise DownloadTimeout()
+                    chunk = r.raw.read(min(_CHUNK, elements.MAX_BYTES + 1 - len(buf)), decode_content=False)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if len(buf) > elements.MAX_BYTES:
+                        raise DownloadTooLarge()
+                if self.abandoned:
+                    raise DownloadTimeout()
+                return 200, bytes(buf)
+            finally:
+                r.close()
 
 
-def _limit_next_read(r, seconds):
-    """Shorten the socket timeout so a single read cannot run past the total deadline."""
+def _shutdown_socket(r):
+    """Wake a read blocked on this response's socket (closing alone does not on every platform)."""
     sock = getattr(getattr(r.raw, "connection", None), "sock", None)
     if sock is not None:
         try:
-            sock.settimeout(max(0.01, seconds))
+            sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+
+
+def _close_quietly(obj):
+    try:
+        obj.close()
+    except Exception:
+        pass
