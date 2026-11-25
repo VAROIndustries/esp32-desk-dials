@@ -1,60 +1,115 @@
 """Propagation and per-observer queries.
 
-tick() propagates every tracked object once for all callers; query() does only the
-observer transform and filtering, cached per (screen, 0.1-degree square, cutoff).
+tick() propagates every tracked object once for all callers: the 60 s track that every
+answer animates, and (every LOOKAHEAD_REFRESH_S) a look-ahead table of positions over
+the screen's pass-search horizon. query()/query_many() do only the observer transform
+and filtering, never propagation; their results are cached per (screen, 0.1-degree
+square, cutoff) for the current tick only.
+
+Memory: each screen's look-ahead table holds objects x steps x 12 bytes (float32 TEME
+positions) plus objects x steps x 1 byte of error flags, where steps is
+(horizon_s + LOOKAHEAD_REFRESH_S) / step. Example: 12,000 Starlink objects over
+20 + 5 minutes at 30 s = 50 steps is about 7.8 MB.
+
+Concurrency: one thread calls tick() and set_screens(); any number of threads query.
+A query takes one consistent snapshot under the lock (every screen from the same tick
+and element set), computes outside it, and caches only if that tick and element set
+are still current.
 """
 from __future__ import annotations
 
+import math
 import threading
 from collections import OrderedDict
 
 import numpy as np
 from sgp4.api import SatrecArray
 
+from screens import SCREENS
 from skymath import azel, compass, unix_to_jd
 
 TRACK_STEP_S = 5
 TRACK_POINTS = 13                 # 60 s of track
 MAX_OBJECTS = 60
-PASS_STEP_S = 30
-PASS_CACHE_S = 300
+PASS_STEP_S = 30                  # look-ahead step for horizons up to one hour
+PASS_STEP_LONG_S = 60             # look-ahead step for longer horizons
+PASS_CACHE_S = 300                # a found pass is reused for at most this long
+PASS_SEARCH_SLOTS = 2             # request-time pass searches allowed at once, all threads
+PASS_CHUNK_POINTS = 200_000       # objects x steps transformed at a time (bounds memory)
+LOOKAHEAD_REFRESH_S = 300         # rebuild a look-ahead table older than this
 CACHE_MAX = 5000
 OLD_EPOCH_S = 14 * 86400          # objects measured longer ago than this are marked "old"
 STALE_TICK_S = 20                 # no tick for this long = the background loop has stalled
 
 
+def _az(a) -> float:
+    """Azimuth rounded to 0.1 degree, always in [0, 360)."""
+    v = round(float(a) % 360.0, 1)
+    return 0.0 if v >= 360.0 else v
+
+
+def _pass_step(horizon_s: int) -> int:
+    return PASS_STEP_S if horizon_s <= 3600 else PASS_STEP_LONG_S
+
+
+def _propagate(arr, unix_times):
+    jd_full = unix_to_jd(np.asarray(unix_times, dtype=float))
+    jd_i = np.floor(jd_full)
+    err, r, _ = arr.sgp4(jd_i, jd_full - jd_i)
+    return jd_full, err, r
+
+
+class _Table:
+    """Positions of every object of one screen at fixed steps after `built`."""
+
+    def __init__(self, arr, built: float, horizon_s: int):
+        self.built = float(built)
+        self.horizon_s = horizon_s
+        self.step = _pass_step(horizon_s)
+        k = math.ceil((horizon_s + LOOKAHEAD_REFRESH_S) / self.step)
+        self.t = self.built + np.arange(1, k + 1) * self.step
+        self.jd, err, r = _propagate(arr, self.t)
+        self.bad = (err != 0) | ~np.isfinite(r).all(axis=2)          # (N, K)
+        self.r = np.where(self.bad[..., None], 0.0, r).astype(np.float32)
+
+
 class _Screen:
-    def __init__(self, elems, tags, fetched_at):
+    def __init__(self, name, elems, tags, fetched_at):
+        self.name = name
         self.names = [e.name for e in elems]
         self.epochs = [e.epoch for e in elems]
         self.tags = list(tags)
         self.arr = SatrecArray([e.sat for e in elems])
         self.fetched_at = fetched_at   # unix time the elements were downloaded (0 = unknown)
         self.r = None             # (N, TRACK_POINTS, 3) km TEME, filled by tick()
-        self.ok = None            # (N,) bool: propagated without error
+        self.ok = None            # (N,) bool: track propagated without error
+        self.table = None         # _Table, filled by tick()
 
 
 class Engine:
     def __init__(self):
         self._lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(PASS_SEARCH_SLOTS)
         self._screens = {}
-        self._t0 = 0.0
+        self._t0 = None           # unix time of the last tick (None = never ticked)
         self._jd = None
-        self._tick_id = 0
-        self._qcache = OrderedDict()
-        self._pcache = OrderedDict()
+        self._version = 0         # bumped by every tick() and set_screens()
+        self._qcache = OrderedDict()   # key -> result, for the current version only
+        self._pcache = OrderedDict()   # key -> (screen, table, t0, val)
         self.dropped = {}             # source -> objects left out as too old (for /health)
 
     def tick_age(self, now_unix: float) -> float:
         """Seconds since the last tick (infinite before the first)."""
         with self._lock:
-            return now_unix - self._t0 if self._t0 else float("inf")
+            return float("inf") if self._t0 is None else now_unix - self._t0
 
     def set_screens(self, built: dict, fetched: dict):
         """built: screen -> (elems, tags) from screens.build_screens; fetched: screen -> unix time."""
-        new = {name: _Screen(elems, tags, fetched.get(name, 0.0)) for name, (elems, tags) in built.items()}
+        new = {name: _Screen(name, elems, tags, fetched.get(name, 0.0))
+               for name, (elems, tags) in built.items()}
         with self._lock:
             self._screens = new
+            self._version += 1
             self._qcache.clear()
             self._pcache.clear()
 
@@ -63,87 +118,171 @@ class Engine:
             return screen in self._screens and self._screens[screen].r is not None
 
     def is_cached(self, screen: str, lat: float, lon: float, cut: int) -> bool:
-        """True when query() would answer from the per-tick cache without calculating."""
+        """True when query() would answer from the current tick's cache without calculating."""
         with self._lock:
             return (screen, lat, lon, cut) in self._qcache
 
     def tick(self, now_unix: float):
-        """Propagate everything for now .. now+60 s. Call every TRACK_STEP_S seconds."""
+        """Propagate everything for now .. now+60 s, and rebuild look-ahead tables that are
+        missing or older than LOOKAHEAD_REFRESH_S. Call every TRACK_STEP_S seconds."""
+        now = float(now_unix)
         with self._lock:
             screens = dict(self._screens)
-        t = now_unix + np.arange(TRACK_POINTS) * TRACK_STEP_S
+        t = now + np.arange(TRACK_POINTS) * TRACK_STEP_S
         jd_full = unix_to_jd(t)
-        jd_i = np.floor(jd_full)
         results = {}
         for name, sc in screens.items():
-            err, r, _ = sc.arr.sgp4(jd_i, jd_full - jd_i)
-            results[name] = (r, (err == 0).all(axis=1))
+            _, err, r = _propagate(sc.arr, t)
+            ok = (err == 0).all(axis=1) & np.isfinite(r).all(axis=(1, 2))
+            tab = sc.table
+            if tab is None or now - tab.built > LOOKAHEAD_REFRESH_S or now < tab.built:
+                tab = _Table(sc.arr, now, SCREENS[name]["horizon_s"])
+            results[name] = (r, ok, tab)
         with self._lock:
-            for name, (r, ok) in results.items():
+            for name, (r, ok, tab) in results.items():
                 if self._screens.get(name) is screens[name]:
-                    screens[name].r, screens[name].ok = r, ok
-            self._t0, self._jd = float(now_unix), jd_full
-            self._tick_id += 1
+                    screens[name].r, screens[name].ok, screens[name].table = r, ok, tab
+            self._t0, self._jd = now, jd_full
+            self._version += 1
             self._qcache.clear()
 
     def query(self, screen: str, lat: float, lon: float, cut: int) -> dict:
-        key = (screen, lat, lon, cut)
+        """One screen; see query_many for the result."""
+        return self.query_many(lat, lon, {screen: cut})[1][screen]
+
+    def query_many(self, lat: float, lon: float, wanted: dict) -> tuple:
+        """wanted: screen -> cutoff. Returns (t0, results): t0 is the unix time of the tick
+        every returned track starts at (0.0 before the first tick), results maps each screen
+        to {"count", "age_h", "objects", "next"} or {"unavailable": True}. All screens come
+        from the same tick.
+
+        "next" (only when nothing is above the cutoff) is the first pass rising within the
+        screen's horizon, or None. Its "from" and "max_el" are sampled at the look-ahead step
+        (30 s, or 60 s for horizons over an hour), and "max_el" is the peak inside the
+        horizon (a pass still climbing at the horizon's end reports its elevation there).
+        When no pass search can run right now, "next" is None and "next_busy" is True.
+        """
+        return self._finish(self._begin(lat, lon, wanted))
+
+    # -- internals: _begin snapshots under the lock, _finish computes and stores --------
+
+    def _begin(self, lat, lon, wanted):
+        plan = {"lat": lat, "lon": lon, "items": {}}
         with self._lock:
-            sc = self._screens.get(screen)
-            hit = self._qcache.get(key)
-            if hit is not None:
-                return hit
-            if sc is None or sc.r is None:
-                return {"unavailable": True}
-            r, ok, jd, t0 = sc.r, sc.ok, self._jd, self._t0
+            plan["version"], plan["t0"], plan["jd"] = self._version, self._t0, self._jd
+            for screen, cut in wanted.items():
+                key = (screen, lat, lon, cut)
+                hit = self._qcache.get(key)
+                if hit is not None:
+                    plan["items"][screen] = ("hit", hit)
+                    continue
+                sc = self._screens.get(screen)
+                if sc is None or sc.r is None:
+                    plan["items"][screen] = ("hit", {"unavailable": True})
+                    continue
+                plan["items"][screen] = ("calc", (cut, sc, sc.r, sc.ok, sc.table,
+                                                  self._pcache.get(key)))
+        return plan
+
+    def _finish(self, plan):
+        lat, lon, t0, jd = plan["lat"], plan["lon"], plan["t0"], plan["jd"]
+        results, store_q, store_p = {}, {}, {}
+        for screen, (kind, data) in plan["items"].items():
+            if kind == "hit":
+                results[screen] = data
+                continue
+            cut, sc, r, ok, table, phit = data
+            key = (screen, lat, lon, cut)
+            out = self._tracks(sc, r, ok, jd, t0, lat, lon, cut)
+            if out["count"] == 0:
+                val, cached = self._cached_pass(phit, sc, table, t0)
+                if not cached:
+                    if table is None or not self._slots.acquire(blocking=False):
+                        out["next_busy"] = True
+                        val = None
+                    else:
+                        try:
+                            val = _search(sc, ok, table, t0, lat, lon, cut)
+                        finally:
+                            self._slots.release()
+                        store_p[key] = (sc, table, t0, val)
+                out["next"] = _pass_out(val, t0)
+            results[screen] = out
+            if "next_busy" not in out:
+                store_q[key] = (sc, out)
+        with self._lock:
+            for key, entry in store_p.items():
+                if self._screens.get(key[0]) is entry[0]:          # element set still current
+                    self._pcache[key] = entry
+                    self._pcache.move_to_end(key)
+            while len(self._pcache) > CACHE_MAX:
+                self._pcache.popitem(last=False)
+            if self._version == plan["version"]:            # tick and element set still current
+                for key, (_, out) in store_q.items():
+                    self._qcache[key] = out
+                while len(self._qcache) > CACHE_MAX:
+                    self._qcache.popitem(last=False)
+        return (0.0 if t0 is None else t0), results
+
+    @staticmethod
+    def _cached_pass(phit, sc, table, t0):
+        """(val, True) if a cached pass search is still the right answer at tick t0."""
+        if phit is None:
+            return None, False
+        psc, ptable, pt0, val = phit
+        if psc is not sc or t0 < pt0 or t0 - pt0 >= PASS_CACHE_S:
+            return None, False
+        if val is not None:
+            return (val, True) if val["at"] > t0 else (None, False)
+        # "nothing rises": still true only while the window ends at the same table row
+        if ptable is not table or table is None:
+            return None, False
+        same_end = (np.searchsorted(table.t, pt0 + table.horizon_s, side="right")
+                    == np.searchsorted(table.t, t0 + table.horizon_s, side="right"))
+        return (None, True) if same_end else (None, False)
+
+    @staticmethod
+    def _tracks(sc, r, ok, jd, t0, lat, lon, cut):
         az, el, _ = azel(r, jd, lat, lon)
         up = np.flatnonzero(ok & (el[:, 0] >= cut))
         order = up[np.argsort(-el[up, 0])][:MAX_OBJECTS]
         objects = []
         for i in order:
             obj = {"n": sc.names[i], "tag": sc.tags[i],
-                   "trk": [[round(float(a), 1), round(float(e), 1)] for a, e in zip(az[i], el[i])]}
+                   "trk": [[_az(a), round(float(e), 1)] for a, e in zip(az[i], el[i])]}
             if t0 - sc.epochs[i] > OLD_EPOCH_S:
                 obj["old"] = True
             objects.append(obj)
         age_h = round((t0 - sc.fetched_at) / 3600.0, 1) if sc.fetched_at else -1.0
-        out = {"count": int(up.size), "age_h": age_h, "objects": objects,
-               "next": None if up.size else self._next_pass(screen, sc, lat, lon, cut, t0)}
-        with self._lock:
-            self._qcache[key] = out
-            while len(self._qcache) > CACHE_MAX:
-                self._qcache.popitem(last=False)
-        return out
+        return {"count": int(up.size), "age_h": age_h, "objects": objects, "next": None}
 
-    def _next_pass(self, screen, sc, lat, lon, cut, t0):
-        from screens import SCREENS
-        key = (screen, lat, lon, cut)
-        with self._lock:
-            hit = self._pcache.get(key)
-        if hit is not None and hit[0] > t0:
-            return _pass_out(hit[1], t0)
-        steps = SCREENS[screen]["horizon_s"] // PASS_STEP_S
-        t = t0 + np.arange(1, steps + 1) * PASS_STEP_S
-        jd_full = unix_to_jd(t)
-        jd_i = np.floor(jd_full)
-        err, r, _ = sc.arr.sgp4(jd_i, jd_full - jd_i)
-        az, el, _ = azel(r, jd_full, lat, lon)
-        above = (el >= cut) & (err == 0)
-        val = None
-        if above.any():
-            first = np.where(above.any(axis=1), above.argmax(axis=1), steps + 1)
-            i = int(first.argmin())
-            j = int(first[i])
-            k = j
-            while k + 1 < steps and above[i, k + 1]:
-                k += 1
-            val = {"n": sc.names[i], "tag": sc.tags[i], "at": float(t[j]),
-                   "from": compass(az[i, j]), "max_el": int(round(float(el[i, j:k + 1].max())))}
-        with self._lock:
-            self._pcache[key] = (t0 + PASS_CACHE_S, val)
-            while len(self._pcache) > CACHE_MAX:
-                self._pcache.popitem(last=False)
-        return _pass_out(val, t0)
+
+def _search(sc, ok, table, t0, lat, lon, cut):
+    """First pass rising after t0 and within the horizon, from the look-ahead table only."""
+    lo = int(np.searchsorted(table.t, t0, side="right"))
+    hi = int(np.searchsorted(table.t, t0 + table.horizon_s, side="right"))
+    if hi <= lo:
+        return None
+    # skip any object the track leaves out, or that fails at any step of the window
+    eligible = np.flatnonzero(ok & ~table.bad[:, lo:hi].any(axis=1))
+    if eligible.size == 0:
+        return None
+    rows = max(1, PASS_CHUNK_POINTS // max(1, eligible.size))
+    for a in range(lo, hi, rows):
+        b = min(hi, a + rows)
+        _, el, _ = azel(table.r[eligible, a:b], table.jd[a:b], lat, lon)
+        above = el >= cut
+        if not above.any():
+            continue
+        first = np.where(above.any(axis=1), above.argmax(axis=1), b - a)
+        idx = int(first.argmin())
+        i, j = int(eligible[idx]), a + int(first[idx])
+        az_i, el_i, _ = azel(table.r[i:i + 1, j:hi], table.jd[j:hi], lat, lon)
+        up = el_i[0] >= cut
+        k = int(up.argmin()) if not up.all() else up.size   # end of this pass in the window
+        return {"n": sc.names[i], "tag": sc.tags[i], "at": float(table.t[j]),
+                "from": compass(az_i[0, 0]), "max_el": int(round(float(el_i[0, :k].max())))}
+    return None
 
 
 def _pass_out(val, t0):
