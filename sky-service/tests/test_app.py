@@ -870,3 +870,14 @@ def test_start_screens_survives_a_failed_build(tmp_path, capsys, monkeypatch):
     assert not eng.has("nasa")
     out = capsys.readouterr().out
     assert "[sky] start-up build failed: RuntimeError" in out and "secret" not in out
+
+
+def test_extra_source_uses_decodo_when_its_token_is_set():
+    base = {"SKY_SPY_KEY": "k" * 24, "SPY_HOBBY_URL": "https://example.test/x.zip", "SPY_PROXY_URL": "http://p.test:1"}
+    plain = {s.name: s for s in A.build_sources(base)[0]}[S.HOBBY_SOURCE]
+    assert plain.proxy == "http://p.test:1" and plain.http_get is None
+    via = {s.name: s for s in A.build_sources(dict(base, SPY_PROXY_KEY="dG9rZW4="))[0]}[S.HOBBY_SOURCE]
+    assert via.proxy is None and callable(via.http_get)
+    with pytest.raises(SystemExit, match="SPY_PROXY_KEY") as e:
+        A.check_env({"SKY_CONTACT": "a@b.test", "SPY_PROXY_KEY": "bad token\n"})
+    assert "bad token" not in str(e.value)

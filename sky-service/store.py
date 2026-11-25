@@ -85,10 +85,10 @@ class Source:
     fetched_at: unix time the current elements were downloaded, or None when never fetched or unknown.
     next_try: no request is made before this unix time. backoff: current back-off in seconds (0 = none).
     last: short status for health(), fixed text only. last_attempt: unix time the last request started,
-    or None.
+    or None. http_get: this source's own fetch function (same signature as Store's), or None to use Store's.
     """
 
-    def __init__(self, name, url, kind, interval_s, proxy=None):
+    def __init__(self, name, url, kind, interval_s, proxy=None, http_get=None):
         if not isinstance(name, str) or not _NAME.fullmatch(name):
             raise ValueError("source name must match [a-z0-9_-]{1,32}")
         if not isinstance(url, str) or not url.startswith("https://"):
@@ -97,6 +97,7 @@ class Source:
         if iv is None or iv < BACKOFF_MIN_S:      # never more than one request per hour per source
             raise ValueError("source interval must be a finite number of seconds >= BACKOFF_MIN_S")
         self.name, self.url, self.kind, self.interval_s, self.proxy = name, url, kind, interval_s, proxy
+        self.http_get = http_get
         self.elems = []
         self.fetched_at = None
         self.next_try = 0.0
@@ -277,7 +278,7 @@ class Store:
         except Exception as e:
             return self._fail(src, now, f"disk error: {type(e).__name__}")
         try:
-            status, body = self.http_get(src.url, {"User-Agent": self.ua}, src.proxy, TIMEOUT_S)
+            status, body = (src.http_get or self.http_get)(src.url, {"User-Agent": self.ua}, src.proxy, TIMEOUT_S)
         except Exception as e:
             return self._fail(src, now, f"network error: {type(e).__name__}", hold_host=True)
         if status != 200:
@@ -337,7 +338,66 @@ def requests_get(url, headers, proxy, timeout):
     """
     if not isinstance(url, str) or not url.startswith("https://"):
         raise ValueError("only https URLs are fetched")
-    job = _Download(url, headers, proxy, min(timeout, TOTAL_TIMEOUT_S))
+    return _run_download(_Download(url, headers, proxy, min(timeout, TOTAL_TIMEOUT_S)))
+
+
+DECODO_ENDPOINT = "https://scraper-api.decodo.com/v2/scrape"
+_TOKEN = re.compile(r"[!-~]{1,512}")              # printable ASCII, no spaces: safe in a header
+_ESCAPED = re.compile(rb"\\x([0-9a-f]{2})")
+
+
+def decodo_get(token):
+    """An http_get that fetches the target URL through the Decodo Web Scraping API.
+
+    POSTs {"url": <target>} to the fixed DECODO_ENDPOINT with the token in the Authorization header only,
+    through the same download path as requests_get (worker thread, total deadline, no redirects, no
+    environment proxies or credentials, TLS verified); the reply may be 4 x elements.MAX_BYTES. The proxy
+    argument is ignored. Decodo writes each byte that is not valid UTF-8 as the four characters \\xNN; that is
+    undone here. A non-200 from Decodo is returned as is; a reply not in the expected form, a target status
+    other than 200 or a Content-Length that does not match gives 502. Nothing raised or returned contains
+    the token or text from the reply.
+    """
+    if not isinstance(token, str) or not _TOKEN.fullmatch(token):
+        raise ValueError("the scraping API token must be printable ASCII without spaces")
+    auth = "Basic " + token
+
+    def get(url, headers, proxy, timeout):
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise ValueError("only https URLs are fetched")
+        h = {k: v for k, v in (headers or {}).items() if k.lower() not in ("authorization", "content-type", "accept")}
+        h.update({"Authorization": auth, "Accept": "application/json", "Content-Type": "application/json"})
+        job = _Download(DECODO_ENDPOINT, h, None, min(timeout, TOTAL_TIMEOUT_S),
+                        method="POST", data=json.dumps({"url": url}).encode(), max_factor=4)
+        status, reply = _run_download(job)
+        if status != 200:
+            return status, b""
+        body = _decodo_body(reply)
+        return (502, b"") if body is None else (200, body)
+
+    return get
+
+
+def _decodo_body(reply):
+    """The target's bytes from a Decodo reply, or None if the reply is not as expected."""
+    try:
+        res = json.loads(reply)["results"][0]
+        content, code = res["content"], res["status_code"]
+        if not isinstance(content, str) or isinstance(code, bool) or code != 200:
+            return None
+        body = _ESCAPED.sub(lambda m: bytes([int(m[1], 16)]), content.encode("utf-8"))
+        hdrs = res.get("headers")
+        if isinstance(hdrs, dict):
+            for k, v in hdrs.items():
+                if isinstance(k, str) and k.lower() == "content-length":
+                    n = str(v).strip() if isinstance(v, (str, int)) and not isinstance(v, bool) else ""
+                    if n.isdigit() and int(n) != len(body):
+                        return None
+        return body
+    except Exception:              # any other shape: never let reply text out
+        return None
+
+
+def _run_download(job):
     job.thread.start()
     if not job.finished.wait(TOTAL_TIMEOUT_S) and job.abandon():
         raise DownloadTimeout()
@@ -349,8 +409,9 @@ def requests_get(url, headers, proxy, timeout):
 class _Download:
     """One download in a daemon thread. Hands its outcome over only if the caller is still waiting."""
 
-    def __init__(self, url, headers, proxy, read_timeout):
+    def __init__(self, url, headers, proxy, read_timeout, method="GET", data=None, max_factor=1):
         self.url, self.proxy, self.t = url, proxy, read_timeout
+        self.method, self.data, self.max_factor = method, data, max_factor
         self.headers = {k: v for k, v in (headers or {}).items() if k.lower() != "accept-encoding"}
         self.headers["Accept-Encoding"] = "identity"
         self.lock = threading.Lock()
@@ -401,9 +462,10 @@ class _Download:
         with requests.Session() as s:
             s.trust_env = False
             self._keep("session", s)
-            r = s.get(self.url, headers=self.headers, timeout=(self.t, self.t),
+            kw = dict(headers=self.headers, timeout=(self.t, self.t),
                       proxies={"https": self.proxy} if self.proxy else {},
                       allow_redirects=False, verify=True, stream=True)
+            r = s.post(self.url, data=self.data, **kw) if self.method == "POST" else s.get(self.url, **kw)
             try:
                 self._keep("response", r)
                 if r.status_code != 200:
@@ -411,15 +473,16 @@ class _Download:
                 enc = (r.headers.get("Content-Encoding") or "identity").strip().lower()
                 if enc != "identity":
                     raise DownloadEncoded()
+                cap = elements.MAX_BYTES * self.max_factor
                 buf = bytearray()
                 while True:
                     if self.abandoned:
                         raise DownloadTimeout()
-                    chunk = r.raw.read(min(_CHUNK, elements.MAX_BYTES + 1 - len(buf)), decode_content=False)
+                    chunk = r.raw.read(min(_CHUNK, cap + 1 - len(buf)), decode_content=False)
                     if not chunk:
                         break
                     buf += chunk
-                    if len(buf) > elements.MAX_BYTES:
+                    if len(buf) > cap:
                         raise DownloadTooLarge()
                 if self.abandoned:
                     raise DownloadTimeout()

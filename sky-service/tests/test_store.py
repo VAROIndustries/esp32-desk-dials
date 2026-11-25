@@ -359,6 +359,10 @@ class FakeSession:
             self.block.wait(5)
         return self.response
 
+    def post(self, url, **kw):
+        self.calls.append((url, dict(kw), self.trust_env))
+        return self.response
+
     def close(self):
         self.closed = True
 
@@ -824,3 +828,53 @@ def test_a_celestrak_error_holds_back_every_celestrak_source_but_not_the_extra_f
     for s in (st, restarted):
         assert [x.name for x in s.due(1000.0 + BACKOFF_MIN_S - 1)] == ["hobby"]
         assert {x.name for x in s.due(1000.0 + BACKOFF_MIN_S)} == {"starlink", "stations", "hobby"}
+
+
+# --- the extra TLE file fetched through the Decodo Web Scraping API ------------------------
+
+DECODO_TOKEN = "VTAwMDAwMTIzNDU2Nzg6c2VjcmV0LXBhc3N3b3Jk"
+
+
+def _decodo_reply(content, status_code=200, length=None):
+    result = {"content": content, "type": "raw", "status_code": status_code, "cookies": [], "task_id": "1"}
+    if length is not None:
+        result["headers"] = {"Content-Length": str(length)}
+    return json.dumps({"results": [result]}).encode()
+
+
+def _decodo_store(tmp_path, log=None):
+    src = Source("extra", "https://example.test/extra.zip", "tle", 24 * 3600,
+                 http_get=store_mod.decodo_get(DECODO_TOKEN))
+    return Store(str(tmp_path), [src], FakeHttp([]), "UA", log=log or (lambda m: None)), src
+
+
+def test_decodo_reply_is_rebuilt_to_the_original_bytes_and_parsed(tmp_path, fake_session):
+    from conftest import ISS_L1, ISS_L2
+    body = _zip_body([("feed.tle", f"ISS\n{ISS_L1}\n{ISS_L2}\n".encode())])
+    content = body.decode("utf-8", "backslashreplace")
+    assert "\\x" in content                                   # the archive does contain invalid UTF-8
+    fake_session["response"] = FakeResponse(200, FakeRaw([_decodo_reply(content, length=len(body))]))
+    store, src = _decodo_store(tmp_path)
+    assert store.refresh(src, 1000.0) is True
+    assert [(e.name, e.satnum) for e in src.elems] == [("ISS", 25544)]
+    assert (tmp_path / "extra.dat").read_bytes().partition(b"\n")[2] == body
+
+
+@pytest.mark.parametrize("reply", [_decodo_reply("x", status_code=404), b"{not json", b'{"results": []}'])
+def test_decodo_target_error_or_malformed_reply_is_502(fake_session, reply):
+    fake_session["response"] = FakeResponse(200, FakeRaw([reply]))
+    assert store_mod.decodo_get(DECODO_TOKEN)("https://example.test/x", {}, None, 60) == (502, b"")
+
+
+def test_decodo_request_carries_the_token_only_in_the_header(tmp_path, fake_session):
+    fake_session["response"] = FakeResponse(401, FakeRaw([b"denied " + DECODO_TOKEN.encode()]))
+    logs = []
+    store, src = _decodo_store(tmp_path, log=logs.append)
+    assert store.refresh(src, 1000.0) is False
+    url, kw, trust_env = FakeSession.instances[0].calls[0]
+    assert url == "https://scraper-api.decodo.com/v2/scrape" and trust_env is False
+    assert kw["headers"]["Authorization"] == "Basic " + DECODO_TOKEN
+    assert json.loads(kw["data"]) == {"url": "https://example.test/extra.zip"}
+    assert kw["allow_redirects"] is False and kw["verify"] is True and kw["proxies"] == {}
+    shown = json.dumps(store.health(1000.0)) + "\n".join(logs) + (tmp_path / "extra.state.json").read_text()
+    assert DECODO_TOKEN not in shown and "HTTP 401" in shown

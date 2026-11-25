@@ -27,6 +27,8 @@ Environment
   SPY_HOBBY         "0" turns the extra source off (default on when SPY_HOBBY_URL is set)
   SPY_HOBBY_URL     https:// address of an extra TLE file for the private screen
   SPY_PROXY_URL     optional proxy used ONLY for SPY_HOBBY_URL
+  SPY_PROXY_KEY     optional token for fetching SPY_HOBBY_URL through the Decodo Web Scraping API
+                    (SPY_PROXY_URL is then not used)
   ORIGIN_SECRET     (>= 24 chars) when set, every request must carry X-Origin-Auth with this
                     value (added by a Cloudflare rule) or it is refused; the caller address is
                     then taken from CF-Connecting-IP. /health from loopback is always answered.
@@ -54,7 +56,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import screens as S
 from engine import Engine, STALE_TICK_S, TRACK_STEP_S
-from store import CELESTRAK_INTERVAL_S, HOBBY_INTERVAL_S, Source, Store, requests_get
+from store import CELESTRAK_INTERVAL_S, HOBBY_INTERVAL_S, Source, Store, decodo_get, requests_get
 
 POLL_S = 50                       # tracks are 60 s long; ask again before they run out
 BUSY_POLL_S = 300
@@ -487,7 +489,11 @@ def build_sources(env):
     hobby_url = env.get("SPY_HOBBY_URL", "")
     hobby_on = bool(env.get("SKY_SPY_KEY")) and env.get("SPY_HOBBY", "1") != "0" and hobby_url.startswith("https://")
     if hobby_on:
-        src.append(Source(S.HOBBY_SOURCE, hobby_url, "tle", HOBBY_INTERVAL_S, env.get("SPY_PROXY_URL") or None))
+        token = env.get("SPY_PROXY_KEY", "")
+        if token:
+            src.append(Source(S.HOBBY_SOURCE, hobby_url, "tle", HOBBY_INTERVAL_S, http_get=decodo_get(token)))
+        else:
+            src.append(Source(S.HOBBY_SOURCE, hobby_url, "tle", HOBBY_INTERVAL_S, env.get("SPY_PROXY_URL") or None))
     return src, hobby_on
 
 
@@ -574,6 +580,12 @@ def check_env(env) -> list:
     origin = env.get("ORIGIN_SECRET", "")
     if origin and len(origin) < MIN_KEY_LEN:
         raise SystemExit(f"ORIGIN_SECRET must be at least {MIN_KEY_LEN} characters")
+    token = env.get("SPY_PROXY_KEY", "")
+    if token:
+        try:
+            decodo_get(token)
+        except ValueError:
+            raise SystemExit("SPY_PROXY_KEY must be printable ASCII without spaces") from None
     for name, lo, hi in NUMERIC_SETTINGS:
         if name in env:
             val = env[name]
