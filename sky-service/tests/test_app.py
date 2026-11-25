@@ -49,9 +49,10 @@ def _ticked_engine():
         _TEMPLATE.append(engine)
         return engine
     tpl = _TEMPLATE[0]
-    for name, sc in engine._screens.items():
+    for name, sc in engine._staged.items():
         src = tpl._screens[name]
         sc.r, sc.ok, sc.table = src.r, src.ok, src.table
+    engine._screens, engine._staged = engine._staged, None       # as a tick swaps the staged set in
     engine._t0, engine._jd, engine._version = tpl._t0, tpl._jd, engine._version + 1
     return engine
 

@@ -809,3 +809,18 @@ def test_zipped_tle_is_accepted_persisted_raw_and_reloaded(tmp_path):
     fresh.load_disk(now=1001.0)
     assert [(e.name, e.satnum) for e in src2.elems] == [("ISS", 25544)] and src2.fetched_at == 1000.0
 
+
+
+def test_a_celestrak_error_holds_back_every_celestrak_source_but_not_the_extra_file(tmp_path):
+    def sources():
+        ct = "https://celestrak.org/NORAD/elements/gp.php?GROUP={}&FORMAT=json"
+        return [Source("starlink", ct.format("starlink"), "omm", 7200),
+                Source("stations", ct.format("stations"), "omm", 7200),
+                Source("hobby", "https://example.test/hobby.tle", "tle", 86400)]
+    st = Store(str(tmp_path), sources(), FakeHttp([(403, b"")]), "UA", log=lambda m: None)
+    st.refresh(st.sources["starlink"], 1000.0)
+    restarted = Store(str(tmp_path), sources(), None, "UA", log=lambda m: None)
+    restarted.load_disk(now=1001.0)
+    for s in (st, restarted):
+        assert [x.name for x in s.due(1000.0 + BACKOFF_MIN_S - 1)] == ["hobby"]
+        assert {x.name for x in s.due(1000.0 + BACKOFF_MIN_S)} == {"starlink", "stations", "hobby"}

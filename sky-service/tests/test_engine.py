@@ -297,7 +297,7 @@ def test_lookahead_table_shape_steps_and_refresh():
     assert eng._screens["starlink"].table is not star
     assert eng._screens["starlink"].table.built == T0 + EN.LOOKAHEAD_REFRESH_S + 5
     eng.set_screens({"nasa": (_elems([omm(25544, "ISS")]), [""])}, {"nasa": T0})
-    assert eng._screens["nasa"].table is None
+    assert eng._staged["nasa"].table is None                   # a new element set starts without one
 
 
 class _NoPropagation:
@@ -383,3 +383,27 @@ def test_per_tick_result_cache_has_its_own_small_bound():
     assert seen == 300 and len(eng._qcache) == EN.QCACHE_MAX
     assert eng.is_cached("nasa", round(lat + 9 * 0.1, 1), round(lon + 7 * 0.1, 1), 0)    # newest kept
     assert not eng.is_cached("nasa", round(lat - 10 * 0.1, 1), round(lon - 7 * 0.1, 1), 0)   # oldest evicted
+
+
+def test_new_screens_take_over_only_once_a_tick_has_tracked_them():
+    lat, lon = _subpoint(T0)
+    lat, lon = round(lat, 1), round(lon, 1)
+    eng = _engine([omm(25544, "ISS")])
+    before = eng.query("nasa", lat, lon, 60)
+    eng.set_screens({"nasa": (_elems([omm(25544, "NEW")]), [""])}, {"nasa": T0})
+    assert eng.query("nasa", lat, lon, 60) == before                 # still answering while it rebuilds
+    eng.tick(T0 + 5)
+    assert eng.query("nasa", lat, lon, 60)["objects"][0]["n"] == "NEW"
+
+
+def test_pass_cache_does_not_keep_old_lookahead_tables_alive():
+    import gc
+    import weakref
+    eng = _engine([omm(25544, "ISS")])
+    refs = []
+    for i in range(3):
+        eng.tick(T0 + i * (EN.LOOKAHEAD_REFRESH_S + 5))
+        refs.append(weakref.ref(eng._screens["nasa"].table))
+        assert eng.query("nasa", 42.0 + i, -71.3, 20)["next"] is not None   # stores a pass search
+    gc.collect()
+    assert [r() is not None for r in refs] == [False, False, True]

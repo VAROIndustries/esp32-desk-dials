@@ -290,7 +290,7 @@ class App:
         else:
             t0, results = self.engine.query_many(lat, lon, visible)   # one snapshot: every screen, one tick
         out = {n: results[n] if n in visible else {"locked": True} for n in names}
-        lag_ms = 0 if stalled else max(0, int((now - t0) * 1000))
+        lag_ms = 0 if stalled else max(0, int((self.clock() - t0) * 1000))   # clock read after the query
         body = {"t": int(now), "poll": POLL_S, "lag_ms": lag_ms, "screens": out}
         if self.notice:
             body["notice"] = self.notice
@@ -597,7 +597,7 @@ def main():
     engine = Engine()
     now = time.time()
     state = start_screens(engine, store, env, hobby_on, now)    # screens from the disk copies first
-    engine.tick(now)
+    tick_once(engine, now)                                      # a failure is logged; the ticker retries
     stop = threading.Event()
     threading.Thread(target=_ticker, args=(engine, stop), name="sky-ticker", daemon=True).start()
     threading.Thread(target=_fetcher, args=(state, engine, store, env, hobby_on, stop),

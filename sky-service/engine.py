@@ -11,6 +11,9 @@ positions) plus objects x steps x 1 byte of error flags, where steps is
 (horizon_s + LOOKAHEAD_REFRESH_S) / step. Example: 12,000 Starlink objects over
 20 + 5 minutes at 30 s = 50 steps is about 7.8 MB.
 
+Rebuilds: set_screens() only stages a new screen set; queries keep using the current one
+until the next tick() has tracked the staged set (tracks and tables), then that tick swaps it in.
+
 Concurrency: one thread calls tick() and set_screens(); any number of threads query.
 A query takes one consistent snapshot under the lock (every screen from the same tick
 and element set), computes outside it, and caches only if that tick and element set
@@ -92,11 +95,12 @@ class Engine:
         self._lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(PASS_SEARCH_SLOTS)
         self._screens = {}
+        self._staged = None       # screen set from set_screens(), swapped in by the next tick()
         self._t0 = None           # unix time of the last tick (None = never ticked)
         self._jd = None
-        self._version = 0         # bumped by every tick() and set_screens()
+        self._version = 0         # bumped by every tick() (which also swaps in staged screens)
         self._qcache = OrderedDict()   # key -> result, for the current version only
-        self._pcache = OrderedDict()   # key -> (screen, table, t0, val)
+        self._pcache = OrderedDict()   # key -> (screen, table.built or None, t0, val)
         self.dropped = {}             # source -> objects left out as too old (for /health)
 
     def tick_age(self, now_unix: float) -> float:
@@ -109,10 +113,7 @@ class Engine:
         new = {name: _Screen(name, elems, tags, fetched.get(name, 0.0))
                for name, (elems, tags) in built.items()}
         with self._lock:
-            self._screens = new
-            self._version += 1
-            self._qcache.clear()
-            self._pcache.clear()
+            self._staged = new          # queries keep the current screens until tick() swaps it in
 
     def has(self, screen: str) -> bool:
         with self._lock:
@@ -128,7 +129,8 @@ class Engine:
         missing or older than LOOKAHEAD_REFRESH_S. Call every TRACK_STEP_S seconds."""
         now = float(now_unix)
         with self._lock:
-            screens = dict(self._screens)
+            staged = self._staged
+            screens = dict(self._screens if staged is None else staged)
         t = now + np.arange(TRACK_POINTS) * TRACK_STEP_S
         jd_full = unix_to_jd(t)
         results = {}
@@ -141,8 +143,13 @@ class Engine:
             results[name] = (r, ok, tab)
         with self._lock:
             for name, (r, ok, tab) in results.items():
-                if self._screens.get(name) is screens[name]:
+                if staged is not None or self._screens.get(name) is screens[name]:
                     screens[name].r, screens[name].ok, screens[name].table = r, ok, tab
+            if staged is not None:      # the staged set is fully tracked: it takes over now
+                self._screens = staged
+                if self._staged is staged:
+                    self._staged = None
+                self._pcache.clear()
             self._t0, self._jd = now, jd_full
             self._version += 1
             self._qcache.clear()
@@ -206,7 +213,7 @@ class Engine:
                             val = _search(sc, ok, table, t0, lat, lon, cut)
                         finally:
                             self._slots.release()
-                        store_p[key] = (sc, table, t0, val)
+                        store_p[key] = (sc, None if table is None else table.built, t0, val)
                 out["next"] = _pass_out(val, t0)
             results[screen] = out
             if "next_busy" not in out:
@@ -230,13 +237,13 @@ class Engine:
         """(val, True) if a cached pass search is still the right answer at tick t0."""
         if phit is None:
             return None, False
-        psc, ptable, pt0, val = phit
+        psc, pbuilt, pt0, val = phit
         if psc is not sc or t0 < pt0 or t0 - pt0 >= PASS_CACHE_S:
             return None, False
         if val is not None:
             return (val, True) if val["at"] > t0 else (None, False)
         # "nothing rises": still true only while the window ends at the same table row
-        if ptable is not table or table is None:
+        if table is None or pbuilt != table.built:
             return None, False
         same_end = (np.searchsorted(table.t, pt0 + table.horizon_s, side="right")
                     == np.searchsorted(table.t, t0 + table.horizon_s, side="right"))

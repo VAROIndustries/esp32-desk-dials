@@ -3,6 +3,9 @@
 Rules this module enforces (CelesTrak usage policy, celestrak.org/usage-policy.php):
   - one group per request, each group at most once per hour;
   - on ANY non-200 reply, stop asking for that source and back off (1 h doubling to 24 h);
+  - CelesTrak blocks by address, so a non-200 reply or network failure from any celestrak.org
+    source holds back EVERY celestrak.org source until that back-off ends (saved, so it survives
+    a restart); other sources keep their own schedule;
   - never retry in a loop.
 
 Two files per source, in data_dir:
@@ -41,6 +44,7 @@ import socket
 import tempfile
 import threading
 import time
+from urllib.parse import urlsplit
 
 import elements
 
@@ -108,6 +112,10 @@ def _finite(v):
         if math.isfinite(v):
             return v
     return None
+
+
+def _celestrak(src) -> bool:
+    return urlsplit(src.url).hostname == "celestrak.org"
 
 
 def _past(v, now):
@@ -271,9 +279,9 @@ class Store:
         try:
             status, body = self.http_get(src.url, {"User-Agent": self.ua}, src.proxy, TIMEOUT_S)
         except Exception as e:
-            return self._fail(src, now, f"network error: {type(e).__name__}")
+            return self._fail(src, now, f"network error: {type(e).__name__}", hold_host=True)
         if status != 200:
-            return self._fail(src, now, f"HTTP {status}")
+            return self._fail(src, now, f"HTTP {status}", hold_host=True)
         try:
             elems = self._parse(src, body)
         except elements.ElementError as e:      # fixed messages from elements.py
@@ -292,12 +300,17 @@ class Store:
         self._persist(src)
         return True
 
-    def _fail(self, src, now, why) -> bool:
+    def _fail(self, src, now, why, hold_host=False) -> bool:
         src.backoff = min(BACKOFF_MAX_S, max(BACKOFF_MIN_S, src.backoff * 2))
         src.next_try = now + src.backoff
         src.last = why
         self.log(f"[store] {src.name}: {why}; keeping last good copy, next try in {src.backoff // 60} min")
         self._persist(src)
+        if hold_host and _celestrak(src):          # CelesTrak blocks by address: hold back every group
+            for other in self.sources.values():
+                if other is not src and _celestrak(other) and other.next_try < src.next_try:
+                    other.next_try = src.next_try
+                    self._persist(other)
         return False
 
     def age_h(self, name, now) -> float:
