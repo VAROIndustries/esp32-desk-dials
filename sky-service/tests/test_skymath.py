@@ -25,8 +25,8 @@ def test_azel_matches_skyfield_reference(dt, az, el, rng):
     assert abs(float(got_rng[0]) - rng) < 0.2
 
 
-def test_azel_matches_live_skyfield_when_installed():
-    sf = pytest.importorskip("skyfield.api")
+def test_azel_matches_live_skyfield():
+    import skyfield.api as sf
     ts = sf.load.timescale(builtin=True)
     sat = sf.EarthSatellite(ISS_L1, ISS_L2, "ISS", ts)
     for dt, lat, lon in [(300, -33.9, 151.2), (4000, 64.1, -21.9), (9000, 0.0, 0.0)]:
