@@ -403,7 +403,7 @@ def jobs(monkeypatch):
     for r in releases:
         r()
     for t in threading.enumerate():
-        if t.name == "store-download":
+        if t.name.startswith("store-download"):          # workers and their reapers
             t.join(2)
             assert not t.is_alive(), "a download worker was left running"
 
@@ -541,6 +541,172 @@ def test_requests_get_body_that_stops_arriving_times_out(fake_session, jobs):
     assert not started[0].thread.is_alive()
     assert resp.closed and len(resp.raw.reads) == 2
     assert started[0].result is None and started[0].error is None and not started[0].finished.is_set()
+
+
+class LoopbackServer:
+    """A plain-HTTP listener on 127.0.0.1: sends `Connection: close` headers (so http.client hands the socket
+    to the response and leaves connection.sock None), then stalls or trickles one byte per `trickle_s`."""
+
+    def __init__(self, trickle_s=None, run_for_s=3.0):
+        import socket
+        import threading
+        self.trickle_s, self.run_for_s = trickle_s, run_for_s
+        self.stop = threading.Event()
+        self.lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.lsock.bind(("127.0.0.1", 0))
+        self.lsock.listen(1)
+        self.port = self.lsock.getsockname()[1]
+        self.thread = threading.Thread(target=self._serve, name="test-loopback-server", daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        import time
+        try:
+            self.lsock.settimeout(5)
+            conn, _ = self.lsock.accept()
+        except OSError:
+            return
+        with conn:
+            try:
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n")
+                end = time.monotonic() + self.run_for_s
+                while not self.stop.is_set() and time.monotonic() < end:
+                    if self.trickle_s is None:
+                        self.stop.wait(0.05)
+                    else:
+                        conn.sendall(b"x")
+                        self.stop.wait(self.trickle_s)
+            except OSError:
+                pass
+
+    def close(self):
+        self.stop.set()
+        self.lsock.close()
+        self.thread.join(5)
+        assert not self.thread.is_alive()
+
+
+@pytest.fixture
+def loopback(fake_session, jobs, monkeypatch):
+    """requests.Session replaced by one whose get() makes a REAL urllib3 request to a loopback listener and
+    wraps it in a real requests.Response (real http.client response, real buffered reader). The https-only
+    check and the HTTPAdapter.send block of the production path stay in force."""
+    import requests
+    import urllib3
+    servers, sessions = [], []
+
+    class LoopbackSession:
+        def __init__(self, server, read_timeout):
+            self.server, self.read_timeout = server, read_timeout
+            self.trust_env, self.closed, self.pool = True, False, None
+            sessions.append(self)
+
+        def get(self, url, **kw):
+            self.pool = urllib3.HTTPConnectionPool("127.0.0.1", self.server.port, maxsize=1, retries=False,
+                                                   timeout=urllib3.Timeout(connect=2, read=self.read_timeout))
+            u = self.pool.urlopen("GET", "/", headers=kw["headers"], preload_content=False, retries=False)
+            adapter = requests.adapters.HTTPAdapter()
+            try:
+                return adapter.build_response(requests.Request("GET", url).prepare(), u)
+            finally:
+                adapter.close()
+
+        def close(self):
+            self.closed = True
+            if self.pool is not None:
+                self.pool.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.close()
+
+    def start(read_timeout, **server_kw):
+        server = LoopbackServer(**server_kw)
+        servers.append(server)
+        monkeypatch.setattr(requests, "Session", lambda: LoopbackSession(server, read_timeout))
+        return server
+
+    yield start, jobs[0], sessions
+    for s in servers:
+        s.close()
+
+
+@pytest.mark.parametrize("case", ["stall", "trickle"])
+def test_requests_get_returns_on_time_when_a_connection_close_body_stalls_or_trickles(loopback, case):
+    """Review round 3: a real response whose connection.sock is None, read through a real BufferedReader.
+    stall: headers then nothing, per-read timeout 2 s. trickle: headers then 1 byte every 0.1 s for 3 s,
+    per-read timeout 1 s (never fires). The caller must be back within the total (0.2 s) plus a margin."""
+    import time
+    start, started, sessions = loopback
+    if case == "stall":
+        server = start(2.0, trickle_s=None, run_for_s=3.0)
+    else:
+        server = start(1.0, trickle_s=0.1, run_for_s=3.0)
+    t0 = time.monotonic()
+    with pytest.raises(store_mod.DownloadTimeout):
+        store_mod.requests_get("https://x.test/a", {}, None, 60)
+    took = time.monotonic() - t0
+    print(f"{case}: caller regained control after {took:.2f}s (total limit 0.2s)")
+    assert took < 0.2 + 0.3
+    started[0].thread.join(1.5)                             # the reaper woke the blocked read
+    assert not started[0].thread.is_alive()
+    assert started[0].result is None and started[0].error is None and not started[0].finished.is_set()
+    assert sessions[0].closed
+    server.close()
+
+
+@pytest.mark.parametrize("variant", ["no_shutdown_methods", "shutdown_raises_attribute_error"])
+def test_requests_get_abandon_tolerates_transports_without_a_usable_shutdown(fake_session, jobs, monkeypatch, variant):
+    """TLS-in-TLS through an https proxy gives an SSLTransport with no shutdown(); nothing it raises may
+    change what the caller sees or escape a thread."""
+    import threading
+    import time
+    started, releases = jobs
+    hook_calls = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: hook_calls.append(args.exc_type))
+    gate = threading.Event()
+    releases.append(gate.set)
+
+    class Transport:                                        # like SSLTransport: no shutdown()
+        pass
+
+    class BadTransport:
+        def shutdown(self, how):
+            raise AttributeError("SSLTransport has no attribute shutdown at https://x.test/a")
+
+    class Body:
+        def __init__(self):
+            self.connection = type("Conn", (), {})()
+            self.connection.sock = Transport() if variant == "no_shutdown_methods" else BadTransport()
+            if variant == "shutdown_raises_attribute_error":
+                def shutdown():
+                    raise AttributeError("no shutdown at https://x.test/a")
+                self.shutdown = shutdown
+
+        def read(self, amt=None, decode_content=None):
+            gate.wait(5)
+            return b""
+
+    resp = FakeResponse(200, Body())
+    fake_session["response"] = resp
+    t0 = time.monotonic()
+    with pytest.raises(store_mod.DownloadTimeout):
+        store_mod.requests_get("https://x.test/a", {}, None, 60)
+    assert time.monotonic() - t0 < 0.2 + 0.3
+    deadline = time.monotonic() + 2
+    while not (resp.closed and FakeSession.instances[0].closed) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert resp.closed and FakeSession.instances[0].closed    # the failing wake-up step did not stop the rest
+    gate.set()
+    started[0].thread.join(2)
+    for t in threading.enumerate():
+        if t.name.startswith("store-download"):
+            t.join(2)
+    assert hook_calls == []
+    assert started[0].result is None and started[0].error is None
 
 
 def test_requests_get_timeouts_never_exceed_the_total(fake_session):

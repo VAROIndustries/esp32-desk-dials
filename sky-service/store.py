@@ -19,6 +19,11 @@ cannot be saved, no request is made. On start, load_disk() schedules the next re
 (saved next_try, fetched_at + interval, last_attempt + BACKOFF_MIN_S), so neither a restart nor a crash
 in the middle of a download leads to an early request.
 
+Downloads (requests_get): the caller is never delayed past TOTAL_TIMEOUT_S. Known limit: an abandoned
+worker stuck in DNS resolution, TCP connect, the TLS handshake or a trickled header read may not be
+wakeable and can linger; its result is discarded, its memory is bounded by the size cap, and the schedule
+(at most one attempt per source per hour) bounds how many can accumulate.
+
 Logs and health() carry only fixed strings, HTTP status codes, exception TYPE names and the fixed
 messages of elements.ElementError: never a URL, a proxy string or foreign exception text.
 """
@@ -304,8 +309,9 @@ def requests_get(url, headers, proxy, timeout):
     No redirects, no proxy or credentials from the environment, TLS verified, body requested
     uncompressed (a Content-Encoding other than identity is refused). The download runs in a daemon
     worker thread; the caller gets control back within TOTAL_TIMEOUT_S whatever the network does (DNS,
-    connect, TLS, headers, chunk framing, body), with DownloadTimeout. An abandoned worker is told to
-    stop, its response and session are closed, and its result is thrown away. Raises DownloadTooLarge
+    connect, TLS, headers, chunk framing, body), with DownloadTimeout. At the deadline the caller only marks
+    the download abandoned and raises; a separate reaper thread then tries to wake the worker (shutting the
+    response's socket) and close its response and session, and the worker's result is thrown away. Raises DownloadTooLarge
     past elements.MAX_BYTES (never more than MAX_BYTES + 1 bytes are held); the response is always closed.
     """
     if not isinstance(url, str) or not url.startswith("https://"):
@@ -345,17 +351,21 @@ class _Download:
             self.finished.set()
 
     def abandon(self) -> bool:
-        """Give up on the download. False if it finished first (its outcome then stands)."""
+        """Give up on the download. False if it finished first (its outcome then stands).
+
+        Runs on the caller's thread, so it only marks the job abandoned (under the job's own lock, never held
+        across I/O) and hands the wake-up to a reaper thread: nothing here touches the response, the session,
+        a socket or any lock the worker may hold while it is blocked in a read.
+        """
         with self.lock:
             if self.finished.is_set():
                 return False
             self.abandoned = True
             r, s = self.response, self.session
-        if r is not None:
-            _shutdown_socket(r)
-            _close_quietly(r)
-        if s is not None:
-            _close_quietly(s)
+        try:
+            threading.Thread(target=_reap, args=(r, s), name="store-download-reaper", daemon=True).start()
+        except BaseException:           # no reaper (thread limit): the worker still stops at its next check
+            pass
         return True
 
     def _keep(self, attr, obj):
@@ -397,18 +407,33 @@ class _Download:
                 r.close()
 
 
-def _shutdown_socket(r):
-    """Wake a read blocked on this response's socket (closing alone does not on every platform)."""
-    sock = getattr(getattr(r.raw, "connection", None), "sock", None)
-    if sock is not None:
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+def _reap(r, s):
+    """Best effort, on its own daemon thread: wake the abandoned worker's blocked read, then close its
+    response and session. If any step blocks, only this thread waits; nothing it raises escapes."""
+    if r is not None:
+        _quietly(_wake, r)
+        _quietly(r.close)
+    if s is not None:
+        _quietly(s.close)
 
 
-def _close_quietly(obj):
+def _wake(r):
+    """Shut the response's socket for reading so a blocked recv returns. urllib3's own hook first: it keeps
+    the socket even when http.client has set connection.sock to None (Connection: close responses)."""
+    raw = getattr(r, "raw", None)
+    shutdown = getattr(raw, "shutdown", None)
+    if callable(shutdown) and _quietly(shutdown):
+        return
+    sock = getattr(getattr(raw, "connection", None), "sock", None)
+    shutdown = getattr(sock, "shutdown", None)       # an SSLTransport (TLS in TLS) has none
+    if callable(shutdown):
+        _quietly(shutdown, socket.SHUT_RDWR)
+
+
+def _quietly(fn, *args) -> bool:
+    """Call fn; True if it returned, False if it raised anything (which is dropped, never logged)."""
     try:
-        obj.close()
-    except Exception:
-        pass
+        fn(*args)
+        return True
+    except BaseException:
+        return False
