@@ -36,6 +36,7 @@ network and paste a key. After that, everything lives on the dial's own settings
 | [`firmware/`](firmware/) | PlatformIO / Arduino firmware (LVGL 8) |
 | [`etsy-service/`](etsy-service/) | Small Python service that turns a shop's Etsy orders and ledger into dial numbers |
 | [`status-service/`](status-service/) | Small Python service that rolls Hetzner Cloud, Coolify and HTTPS checks into one status for the dials |
+| [`sky-service/`](sky-service/) | Small Python service that works out which satellites are overhead, for the Sky source |
 | [`docs/`](docs/) | The browser installer, served by GitHub Pages at dial.varo.industries |
 
 ## Build it yourself
