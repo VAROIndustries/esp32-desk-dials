@@ -366,3 +366,20 @@ def test_cached_no_pass_is_searched_again_once_the_horizon_moves_on():
     eng.tick(T0 + 60)
     nxt = eng.query("starlink", lat, lon, 60)["next"]
     assert nxt["n"] == "ISS" and nxt["in_s"] == 1170
+
+
+def test_per_tick_result_cache_has_its_own_small_bound():
+    import engine as EN
+    assert EN.QCACHE_MAX == 256 and EN.CACHE_MAX == 5000
+    eng = _engine([omm(25544, "ISS")])
+    lat, lon = (round(v, 1) for v in _subpoint(T0))
+    seen = 0
+    for i in range(20):                      # 300 distinct squares near the ISS, all with it overhead
+        for j in range(15):
+            out = eng.query("nasa", round(lat + (i - 10) * 0.1, 1), round(lon + (j - 7) * 0.1, 1), 0)
+            assert out["count"] == 1
+            seen += 1
+            assert len(eng._qcache) <= EN.QCACHE_MAX
+    assert seen == 300 and len(eng._qcache) == EN.QCACHE_MAX
+    assert eng.is_cached("nasa", round(lat + 9 * 0.1, 1), round(lon + 7 * 0.1, 1), 0)    # newest kept
+    assert not eng.is_cached("nasa", round(lat - 10 * 0.1, 1), round(lon - 7 * 0.1, 1), 0)   # oldest evicted

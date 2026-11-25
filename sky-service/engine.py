@@ -4,7 +4,7 @@ tick() propagates every tracked object once for all callers: the 60 s track that
 answer animates, and (every LOOKAHEAD_REFRESH_S) a look-ahead table of positions over
 the screen's pass-search horizon. query()/query_many() do only the observer transform
 and filtering, never propagation; their results are cached per (screen, 0.1-degree
-square, cutoff) for the current tick only.
+square, cutoff) for the current tick only, at most QCACHE_MAX of them.
 
 Memory: each screen's look-ahead table holds objects x steps x 12 bytes (float32 TEME
 positions) plus objects x steps x 1 byte of error flags, where steps is
@@ -37,7 +37,8 @@ PASS_CACHE_S = 300                # a found pass is reused for at most this long
 PASS_SEARCH_SLOTS = 2             # request-time pass searches allowed at once, all threads
 PASS_CHUNK_POINTS = 200_000       # objects x steps transformed at a time (bounds memory)
 LOOKAHEAD_REFRESH_S = 300         # rebuild a look-ahead table older than this
-CACHE_MAX = 5000
+CACHE_MAX = 5000                  # pass-search cache entries (small: one pass each)
+QCACHE_MAX = 256                  # per-tick results (up to ~116 KB each at 60 objects: ~30 MB)
 OLD_EPOCH_S = 14 * 86400          # objects measured longer ago than this are marked "old"
 STALE_TICK_S = 20                 # no tick for this long = the background loop has stalled
 
@@ -220,7 +221,7 @@ class Engine:
             if self._version == plan["version"]:            # tick and element set still current
                 for key, (_, out) in store_q.items():
                     self._qcache[key] = out
-                while len(self._qcache) > CACHE_MAX:
+                while len(self._qcache) > QCACHE_MAX:
                     self._qcache.popitem(last=False)
         return (0.0 if t0 is None else t0), results
 
