@@ -400,7 +400,9 @@ class SkyServer(ThreadingHTTPServer):
 
     def server_close(self):
         super().server_close()
-        self._watchdog.stop()
+        watchdog = getattr(self, "_watchdog", None)    # absent when the bind in __init__ failed
+        if watchdog is not None:
+            watchdog.stop()                            # idempotent
 
 
 def make_handler(app, slots=None):

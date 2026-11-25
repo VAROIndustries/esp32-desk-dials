@@ -439,6 +439,30 @@ def _stop(srv):
     srv.server_close()
 
 
+def test_port_in_use_raises_the_bind_error_not_an_attribute_error(tmp_path):
+    app, _, _ = _app(tmp_path)
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        blocker.bind(("127.0.0.1", 0))
+        port = blocker.getsockname()[1]
+        with pytest.raises(OSError) as e:
+            A.SkyServer(("127.0.0.1", port), A.make_handler(app, None))
+        exc = e.value
+        assert not isinstance(exc, AttributeError)
+        assert not isinstance(exc.__context__, AttributeError)
+        assert not isinstance(exc.__cause__, AttributeError)
+    finally:
+        blocker.close()
+
+
+def test_server_close_is_idempotent(tmp_path):
+    app, _, _ = _app(tmp_path)
+    srv, _ = _serve(app)
+    srv.shutdown()
+    srv.server_close()
+    srv.server_close()
+
+
 def test_real_server_answers_and_logs_no_location(tmp_path, capsys):
     app, here, _ = _app(tmp_path)
     srv, base = _serve(app)
