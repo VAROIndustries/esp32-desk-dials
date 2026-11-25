@@ -14,14 +14,15 @@ ahead) and `nasa` (a fixed list of nine NASA satellites above 20 degrees, next p
 
 `/v1/sky` takes plain decimals for `lat` and `lon`, one to three distinct screen names in
 `screens`, and an optional `cut` (minimum elevation in degrees, 0 to 85, at most two digits
-per screen). Anything else is a 400.
+per screen). Any invalid value is a 400. Unknown query parameters are ignored (more than 8
+fields in all is a 400); if a parameter is repeated, the first one is used.
 
 Reply:
 
     {"t": 1795631161, "poll": 50, "lag_ms": 591, "screens": {...}, "notice": "..."}
 
 - `t`: server time (unix seconds). `poll`: seconds the dial should wait before asking again
-  (50 normally, 300 when the service is busy). `notice`: only present when `SKY_NOTICE` is set.
+  (always 50 in a 200 reply). `notice`: only present when `SKY_NOTICE` is set.
 - `lag_ms`: how old the start of every track was when the reply was built. The dial starts
   that far into each track. Replies are never cached: every reply, including errors, carries
   `Cache-Control: private, no-store`.
@@ -39,7 +40,9 @@ Reply:
   `{"locked": true}`.
 
 Errors are short JSON: 400 (bad request), 403 (missing edge header, see `ORIGIN_SECRET`),
-404, 405 (only GET), 429 (per-address limit, with `Retry-After`), 503 (busy).
+404, 405 (only GET), 429 (per-address limit, with `Retry-After`), 500 (`"internal error"` or
+`"reply too large"`), 503 (busy, with `Retry-After`). Only the 429 and 503 busy replies carry
+`"poll": 300`; a 200 always has `"poll": 50`.
 
 `/health` reports `ok`, `tick_age_s` (seconds since the last calculation), `edge_locked`,
 `dropped_old` (objects left out as too old, per source) and per-source `objects`, `age_h` and
@@ -108,9 +111,10 @@ the look-ahead table for pass searches) under 2.
 
 ## Privacy
 
-The service stores nothing about callers. Query strings, paths and caller addresses are never
-logged: a request log line is only the status and a route label (`/v1/sky`, `/health` or
-`other`). Dials send a location rounded to 0.1 degree, and the service rounds it again.
+The service keeps no record of callers. Caller addresses (IPv6 by /64) are held in memory for
+the current minute only, for rate limiting, and are never written to disk or logged. Query
+strings and paths are never logged either: a request log line is only the status and a route
+label (`/v1/sky`, `/health` or `other`). Dials send a location rounded to 0.1 degree, and the service rounds it again.
 
 ## Tests
 
