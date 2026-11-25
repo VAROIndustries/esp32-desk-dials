@@ -22,7 +22,11 @@ in the middle of a download leads to an early request.
 Downloads (requests_get): the caller is never delayed past TOTAL_TIMEOUT_S. Known limit: an abandoned
 worker stuck in DNS resolution, TCP connect, the TLS handshake or a trickled header read may not be
 wakeable and can linger; its result is discarded, its memory is bounded by the size cap, and the schedule
-(at most one attempt per source per hour) bounds how many can accumulate.
+(at most one attempt per source per hour) bounds how many can accumulate. Two more cases where the
+worker cannot be woken: a download through an https:// proxy (TLS inside TLS: the inner SSLTransport
+has no shutdown hook), and on urllib3 1.x, where the response has no raw.shutdown, a `Connection: close`
+response (http.client has already dropped its socket reference), so that worker lingers until its
+per-read timeout. In every case the caller is still never delayed past TOTAL_TIMEOUT_S.
 
 Logs and health() carry only fixed strings, HTTP status codes, exception TYPE names and the fixed
 messages of elements.ElementError: never a URL, a proxy string or foreign exception text.
@@ -412,9 +416,9 @@ def _reap(r, s):
     response and session. If any step blocks, only this thread waits; nothing it raises escapes."""
     if r is not None:
         _quietly(_wake, r)
-        _quietly(r.close)
+        _quietly(lambda: r.close())          # the lookup itself is inside the guard
     if s is not None:
-        _quietly(s.close)
+        _quietly(lambda: s.close())
 
 
 def _wake(r):

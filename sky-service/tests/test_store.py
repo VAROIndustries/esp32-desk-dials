@@ -761,3 +761,20 @@ def test_interval_below_the_hourly_minimum_is_refused(interval):
 
 def test_interval_of_exactly_one_hour_is_allowed():
     assert Source("ok", "https://example.test/x", "omm", BACKOFF_MIN_S).interval_s == BACKOFF_MIN_S
+
+
+def test_reap_survives_close_attributes_that_raise_on_lookup():
+    closed = []
+
+    class Hostile:
+        @property
+        def close(self):                     # even looking the attribute up raises
+            raise RuntimeError("lookup")
+
+    class Session:
+        def close(self):
+            closed.append("session")
+
+    store_mod._reap(Hostile(), Session())     # does not raise; the session is still closed
+    assert closed == ["session"]
+    store_mod._reap(None, Hostile())          # a hostile session is tolerated too
