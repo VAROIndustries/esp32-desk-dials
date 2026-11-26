@@ -32,6 +32,7 @@ static lv_obj_t *s_ringDots[MAX_RING];
 static int       s_dotCount = 0, s_dotActive = 0;
 static bool      s_cents = false;
 static bool      s_msgShown = false;
+static bool      s_scope = false;      // sky scope shows: number widgets hidden
 static ViewData  s_view;
 static void (*s_onTap)() = nullptr;
 static void (*s_onLong)() = nullptr;
@@ -114,15 +115,15 @@ static void render() {
     const bool two = v.twoCol;
     for (int i = 0; i < MAX_DOTS; ++i) {
         lv_obj_set_style_bg_color(s_dots[i], i == s_dotActive ? C_MARIGOLD : C_RING, 0);
-        lv_obj_align(s_dots[i], LV_ALIGN_CENTER, -9 * (s_dotCount - 1) + i * 18, 140);
+        lv_obj_align(s_dots[i], LV_ALIGN_CENTER, -9 * (s_dotCount - 1) + i * 18, s_scope ? 214 : 140);
         if (s_msgShown || i >= s_dotCount) lv_obj_add_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN);
         else                               lv_obj_clear_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN);
     }
 
-    render_ring(v.ring, v.have && !s_msgShown);
+    render_ring(v.ring, v.have && !s_msgShown && !s_scope);
 
     lv_obj_t *const cols[] = { s_colHdr[0], s_colVal[0], s_colSub[0], s_colHdr[1], s_colVal[1], s_colSub[1] };
-    if (s_msgShown) {
+    if (s_msgShown || s_scope) {
         lv_obj_add_flag(s_hdr, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_big, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_sub, LV_OBJ_FLAG_HIDDEN);
@@ -363,6 +364,8 @@ void ui_create(void (*onTap)(), void (*onLongPress)()) {
 }
 
 void ui_set_view(const ViewData &v) { s_view = v; render(); }
+void ui_set_scope_mode(bool on) { s_scope = on; render(); }
+lv_obj_t *ui_screen() { return s_scr; }      // parent for the scope
 void ui_set_cents(bool show)  { s_cents = show; render(); }
 void ui_set_dots(int count, int active) {
     s_dotCount = count < 0 ? 0 : (count > MAX_DOTS ? MAX_DOTS : count);

@@ -70,7 +70,9 @@
 /*==================
    ASSERTS / DEBUG
  *==================*/
+#ifndef LV_USE_PERF_MONITOR      /* sky-gate env sets it to 1 */
 #define LV_USE_PERF_MONITOR 0
+#endif
 #define LV_USE_MEM_MONITOR 0
 #define LV_USE_REFR_DEBUG 0
 

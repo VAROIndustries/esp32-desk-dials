@@ -1,6 +1,9 @@
 #pragma once
 #include <stdint.h>
 
+struct _lv_obj_t;
+typedef struct _lv_obj_t lv_obj_t;
+
 // One screen's worth of content. main.cpp builds it from the data source + settings;
 // the UI only lays it out.
 struct ViewData {
@@ -28,6 +31,10 @@ void ui_set_message(const char *title, const char *body);
 // Footer line: "updated 2m ago" (ok) or an error in red.
 void ui_set_status(const char *text, bool error);
 void ui_set_battery(int percent, bool charging, bool present);
+// Sky scope mode: hide header/big/sub/columns/status ring; keep battery, status, page dots
+// (moved down to clear the scope footer), message and menu.
+void ui_set_scope_mode(bool on);
+lv_obj_t *ui_screen();                   // the dial screen, parent for the scope
 
 // ---- on-dial settings screen (long-press) ----
 struct MenuInfo {
