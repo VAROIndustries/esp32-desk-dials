@@ -132,4 +132,12 @@ void next_text(char *out, size_t n, const Next &nx) {
     snprintf(out, n, "%s %s, from %s, peaks %d deg up", nx.name, when, nx.from[0] ? nx.from : "?", (int)nx.max_el);
 }
 
+void rotate(int &x, int &y, int northOffsetDeg) {
+    if (northOffsetDeg % 360 == 0) return;
+    // The dial's top faces `off` degrees east of north, so everything turns by -off.
+    const float a = -northOffsetDeg * (float)M_PI / 180.f, c = cosf(a), s = sinf(a);
+    const float nx = x * c - y * s, ny = x * s + y * c;
+    x = (int)lroundf(nx); y = (int)lroundf(ny);
+}
+
 }  // namespace sky

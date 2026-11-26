@@ -63,5 +63,8 @@ bool project(float az, float el, int cut, int radius, int &x, int &y);
 int  build_query(char *out, size_t n, float lat, float lon, const ScreenId *ids, int nIds, const int *cuts);
 // "ISS in 12 min, from NW, peaks 64 deg up"
 void next_text(char *out, size_t n, const Next &nx);
+// Turn a scope point (offset from the centre, px) so true north sits at -northOffsetDeg on the
+// dial: northOffsetDeg is the direction the top of the dial faces, clockwise from true north.
+void rotate(int &x, int &y, int northOffsetDeg);
 
 }  // namespace sky
