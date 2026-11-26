@@ -5,7 +5,7 @@
 // verified it against ESPHome, xiaozhi-esp32 and the Waveshare schematic.
 
 #define FW_NAME             "VARO Desk Dial"
-#define FW_VERSION          "1.3.1"
+#define FW_VERSION          "1.4.0-beta1"
 #define BOARD_NAME          "ESP32-S3-Touch-AMOLED-1.75"
 
 #define SCREEN_W            466
@@ -43,6 +43,7 @@
 #define DEFAULT_API_BASE    "https://api.fairkeep.app/api/v1"
 #define DEFAULT_ETSY_BASE   "https://etsydial.varo.industries"
 #define DEFAULT_STATUS_BASE "https://dialstatus.varo.industries"
+#define DEFAULT_SKY_BASE    "https://sky.varo.industries"
 #define DEFAULT_POLL_S      60      // FairKeep allows 60 calls/min per key; once a minute is plenty
 #define MIN_POLL_S          30
 #define MAX_POLL_S          900

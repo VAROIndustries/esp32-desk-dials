@@ -6,6 +6,8 @@
 //   Etsy      GET {etBase}/summary        (Etsy dial service key, see etsy-service/)
 //             views: Today / Month / Year; gross by default, optionally after Etsy fees
 //             (and optionally after postage labels too)
+//   Sky       GET {skyBase}/v1/sky       (no key; a sky key opens the Spy screen)
+//             screens: Starlink / NASA / Spy, drawn as a scope with moving dots
 // Setup: first boot opens the DeskDial-Setup hotspot (WiFi + key). Afterwards
 // everything is on http://deskdial.local/ (or the dial's IP).
 // Touch: tap = next view (unless the view is locked), long-press = settings screen
@@ -28,8 +30,11 @@
 #include "display.h"
 #include "battery.h"
 #include "ui.h"
+#include "sky.h"
+#include "scope.h"
+#include <math.h>
 
-enum Source : uint8_t { SRC_FAIRKEEP = 0, SRC_ETSY = 1, SRC_STATUS = 2, SRC_COUNT };
+enum Source : uint8_t { SRC_FAIRKEEP = 0, SRC_ETSY = 1, SRC_STATUS = 2, SRC_SKY = 3, SRC_COUNT };
 enum FkMode : uint8_t { FK_TOTAL = 0, FK_POS, FK_WEB, FK_ALL, FK_COUNT };
 enum EtMode : uint8_t { ET_TODAY = 0, ET_MONTH, ET_YEAR, ET_SHIP, ET_COUNT };
 enum StMode : uint8_t { ST_ALL = 0, ST_SERVERS, ST_COUNT };
@@ -53,10 +58,31 @@ struct Settings {
     String   pin;                // web settings page PIN (6 digits, made up on first boot)
     bool     cycleOn = false;    // step through the views by itself
     uint8_t  cycleS = 15;        // ...every this many seconds
+    float    skyLat = NAN, skyLon = NAN;   // NAN = not set
+    String   skyKey, skyBase = DEFAULT_SKY_BASE;
+    uint8_t  skyOn = 0b011;                // bit per sky::ScreenId; default Starlink + NASA
+    uint8_t  skyCut[sky::SCR_COUNT] = { 60, 20, 20 };
+    uint8_t  skyMode = sky::SCR_STARLINK;
 
-    const String &key() const  { return src == SRC_ETSY ? etKey : src == SRC_STATUS ? stKey : fkKey; }
-    const String &base() const { return src == SRC_ETSY ? etBase : src == SRC_STATUS ? stBase : fkBase; }
+    const String &key() const  { return src == SRC_ETSY ? etKey : src == SRC_STATUS ? stKey : src == SRC_SKY ? skyKey : fkKey; }
+    const String &base() const { return src == SRC_ETSY ? etBase : src == SRC_STATUS ? stBase : src == SRC_SKY ? skyBase : fkBase; }
+    bool skyHasLoc() const { return !isnan(skyLat) && !isnan(skyLon); }
+    // enabled = switched on, and spy only with a key
+    bool skyEnabled(int id) const { return (skyOn >> id & 1) && (id != sky::SCR_SPY || skyKey.length()); }
 };
+
+// Next enabled sky screen after `from` (wraps); `from` itself if no other is enabled.
+static int skyNextEnabled(const Settings &s, int from) {
+    for (int k = 1; k < sky::SCR_COUNT; ++k) {
+        const int id = (from + k) % sky::SCR_COUNT;
+        if (s.skyEnabled(id)) return id;
+    }
+    return from;
+}
+// Keep skyMode on an enabled screen (it stays put if none is enabled).
+static void skyFixMode(Settings &s) {
+    if (!s.skyEnabled(s.skyMode)) s.skyMode = skyNextEnabled(s, s.skyMode);
+}
 static Settings    g_set;
 static Preferences g_prefs;
 
@@ -84,6 +110,16 @@ static void loadSettings() {
     g_set.pin      = g_prefs.getString("pin", "");
     g_set.cycleOn  = g_prefs.getBool("cycle", false);
     g_set.cycleS   = constrain(g_prefs.getUChar("cycles", 15), 5, 120);
+    g_set.skyLat   = g_prefs.getFloat("skylat", NAN);
+    g_set.skyLon   = g_prefs.getFloat("skylon", NAN);
+    if (!isfinite(g_set.skyLat) || !isfinite(g_set.skyLon)) g_set.skyLat = g_set.skyLon = NAN;
+    g_set.skyKey   = g_prefs.getString("skykey", "");
+    g_set.skyBase  = g_prefs.getString("skybase", DEFAULT_SKY_BASE);
+    g_set.skyOn    = g_prefs.getUChar("skyon", 0b011) & 0b111;
+    for (int i = 0; i < sky::SCR_COUNT; ++i)
+        g_set.skyCut[i] = constrain(g_prefs.getUChar((String("skycut") + i).c_str(), sky::default_cut((sky::ScreenId)i)), 0, 85);
+    g_set.skyMode  = g_prefs.getUChar("skymode", sky::SCR_STARLINK) % sky::SCR_COUNT;
+    skyFixMode(g_set);
     g_prefs.end();
 }
 
@@ -108,6 +144,13 @@ static void saveSettings() {
     g_prefs.putString("pin", g_set.pin);
     g_prefs.putBool("cycle", g_set.cycleOn);
     g_prefs.putUChar("cycles", g_set.cycleS);
+    g_prefs.putFloat("skylat", g_set.skyLat);
+    g_prefs.putFloat("skylon", g_set.skyLon);
+    g_prefs.putString("skykey", g_set.skyKey);
+    g_prefs.putString("skybase", g_set.skyBase);
+    g_prefs.putUChar("skyon", g_set.skyOn);
+    for (int i = 0; i < sky::SCR_COUNT; ++i) g_prefs.putUChar((String("skycut") + i).c_str(), g_set.skyCut[i]);
+    g_prefs.putUChar("skymode", g_set.skyMode);
     g_prefs.end();
 }
 
@@ -312,17 +355,55 @@ static void doFetch() {
     Serial.printf("[fetch] ok (%s)\n", src == SRC_ETSY ? "etsy" : src == SRC_STATUS ? "status" : "fairkeep");
 }
 
+// Sky: fetch task only. Lock order: g_lock is never taken while holding sky_lock.
+static void doSkyFetch() {
+    SkyRequest r;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_set.src != SRC_SKY || !g_set.skyHasLoc()) { xSemaphoreGive(g_lock); return; }   // switched away meanwhile
+    r.base = g_set.skyBase; r.key = g_set.skyKey; r.lat = g_set.skyLat; r.lon = g_set.skyLon;
+    for (int i = 0; i < sky::SCR_COUNT; ++i) r.cuts[i] = g_set.skyCut[i];
+    r.nIds = 0;
+    r.ids[r.nIds++] = (sky::ScreenId)g_set.skyMode;
+    if (g_set.cycleOn) {
+        const int nx = skyNextEnabled(g_set, g_set.skyMode);
+        if (nx != g_set.skyMode) r.ids[r.nIds++] = (sky::ScreenId)nx;
+    }
+    xSemaphoreGive(g_lock);
+    int code = 0;
+    const SkyErr e = sky_fetch(r, &code);
+    String notice;
+    if (e == SKY_OK) {
+        sky_lock();
+        const sky::Reply *rp = sky_reply();
+        if (rp && rp->notice[0]) notice = rp->notice;
+        sky_unlock();
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_set.src == SRC_SKY) {
+        if (e == SKY_OK) {
+            g_err = ""; g_warn = notice; g_lastOkMs = millis(); g_dataSrc = SRC_SKY;
+        } else if (e == SKY_BUSY)    g_err = "sky service busy - trying again later";
+        else if (e == SKY_NO_MEMORY) g_err = "Not enough memory for Sky";
+        else                         g_err = "sky service unreachable. Check dial.varo.industries for status.";
+        g_dirty = true;
+    }
+    xSemaphoreGive(g_lock);
+    Serial.printf("[sky] fetch %d (http %d)\n", (int)e, code);
+}
+
 static void fetchTask(void *) {
     uint32_t last = 0;
     for (;;) {
         xSemaphoreTake(g_lock, portMAX_DELAY);
-        const uint32_t period = (uint32_t)g_set.pollS * 1000UL;
-        const bool     hasKey = !g_set.key().isEmpty();
+        const bool     isSky = g_set.src == SRC_SKY;
+        const uint32_t period = isSky ? (uint32_t)sky_next_poll_s() * 1000UL : (uint32_t)g_set.pollS * 1000UL;
+        const bool     hasKey = isSky ? g_set.skyHasLoc() : !g_set.key().isEmpty();
         xSemaphoreGive(g_lock);
         if (g_fetchNow || (last == 0) || (millis() - last >= period)) {
             if (WiFi.status() == WL_CONNECTED && hasKey) {
                 g_fetchNow = false;
-                doFetch();
+                if (isSky) doSkyFetch();
+                else       doFetch();
                 last = millis();
             }
         }
@@ -490,6 +571,18 @@ static ViewData buildView() {
 
 static void renderView() {
     xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_set.src == SRC_SKY) {          // the scope draws itself (skyFrame); only the page dots here
+        int nEn = 0, active = 0;
+        for (int i = 0; i < sky::SCR_COUNT; ++i) {
+            if (!g_set.skyEnabled(i)) continue;
+            if (i == g_set.skyMode) active = nEn;
+            nEn++;
+        }
+        const int count = !(g_set.tapCycles || g_set.cycleOn) ? 0 : nEn;
+        xSemaphoreGive(g_lock);
+        ui_set_dots(count, active);
+        return;
+    }
     ViewData v = buildView();
     const int count = !(g_set.tapCycles || g_set.cycleOn) ? 0 : g_set.src == SRC_ETSY ? (int)ET_COUNT
                     : g_set.src == SRC_STATUS ? (int)ST_COUNT : (int)FK_COUNT;
@@ -499,19 +592,125 @@ static void renderView() {
     ui_set_view(v);
 }
 
+// One scope frame from the current sky reply. UI loop (core 1) only. g_set is written only on
+// this core (web page, taps), so reading skyMode/skyCut here needs no g_lock.
+static void skyFrame() {
+    static ScopeDot dots[sky::MAX_OBJ];
+    static int      objIx[sky::MAX_OBJ];     // dots[k] shows s->obj[objIx[k]]
+    const int id = g_set.skyMode, cut = g_set.skyCut[id];
+    char hdr[48], l1[64] = "", l2[96] = "", foot[64] = "";
+    snprintf(hdr, sizeof(hdr), "%s", sky::screen_title((sky::ScreenId)id));
+    int n = 0;
+    sky_lock();
+    const sky::Reply *rp = sky_reply();
+    const sky::Screen *s = rp ? &rp->scr[id] : nullptr;
+    const float t = rp ? rp->lag_ms / 1000.f + (millis() - sky_reply_ms()) / 1000.f : 0;
+    if (!s || s->state == sky::ST_NONE) {
+        snprintf(l1, sizeof(l1), "loading...");
+    } else if (s->state == sky::ST_LOCKED) {
+        snprintf(l1, sizeof(l1), "needs the sky key");
+    } else if (s->state == sky::ST_UNAVAILABLE) {
+        snprintf(l1, sizeof(l1), "sky service unreachable.");
+        snprintf(l2, sizeof(l2), "Check dial.varo.industries for status.");
+    } else {
+        int best = -1; float bestEl = -99; bool anyHobby = false;
+        bool ranOut = s->n > 0;              // true until some object still has a position at t
+        for (int i = 0; i < s->n && n < sky::MAX_OBJ; ++i) {
+            const sky::Obj &o = s->obj[i];
+            float az, el;
+            if (!sky::position(o, t, az, el)) continue;   // past the end of its track
+            ranOut = false;
+            int x, y;
+            if (!sky::project(az, el, cut, SCOPE_R, x, y)) continue;   // below the cutoff: hidden
+            ScopeDot &d = dots[n];
+            d.x = x; d.y = y; d.ntail = 0;
+            for (int k = 0; k < 2; ++k) {
+                float a2, e2; int x2, y2;
+                if (sky::position(o, t - 6.f * (k + 1), a2, e2) && sky::project(a2, e2, cut, SCOPE_R, x2, y2)) {
+                    d.tx[d.ntail] = x2; d.ty[d.ntail] = y2; d.ntail++;
+                } else break;
+            }
+            const bool hobby = !strcmp(o.tag, "HOBBY");
+            anyHobby |= hobby;
+            d.style = (o.old || hobby) ? SD_HOLLOW : SD_FILL;
+            objIx[n] = i;
+            if (el > bestEl) { bestEl = el; best = n; }
+            n++;
+        }
+        if (ranOut) {
+            snprintf(l1, sizeof(l1), "sky service unreachable.");
+            snprintf(l2, sizeof(l2), "Check dial.varo.industries for status.");
+            n = 0;
+        } else if (best < 0) {
+            snprintf(l1, sizeof(l1), "nothing overhead");
+            if (s->next.have) sky::next_text(l2, sizeof(l2), s->next);
+            else snprintf(l2, sizeof(l2), "no pass in the next %s", id == sky::SCR_STARLINK ? "20 min" : "24 h");
+        } else {
+            dots[best].style |= SD_HILITE;
+            const sky::Obj &o = s->obj[objIx[best]];
+            const int el = (int)lroundf(bestEl);
+            if (id == sky::SCR_STARLINK) {
+                snprintf(l1, sizeof(l1), "%ld overhead", (long)s->count);
+                snprintf(l2, sizeof(l2), "%s%s", o.name, o.old ? "  -  position approximate" : "");
+            } else {
+                snprintf(l1, sizeof(l1), "%s%s%s", o.name, o.tag[0] ? "  -  " : "", o.tag);
+                snprintf(l2, sizeof(l2), "%d deg up%s", el, o.old ? "  -  position approximate" : "");
+            }
+        }
+        if (id == sky::SCR_SPY && anyHobby)           snprintf(foot, sizeof(foot), "amateur observations, may be inaccurate");
+        else if (id == sky::SCR_SPY && s->hobby == 0) snprintf(foot, sizeof(foot), "military list only (amateur list not loaded)");
+        else if (s->age_h > sky::OLD_DATA_H)          snprintf(foot, sizeof(foot), "data is old");
+    }
+    sky_unlock();
+    scope_set_dots(dots, n);
+    scope_set_text(hdr, l1, l2, foot);
+}
+
+// Sky selected: buffers + scope; another source: free everything Sky. UI core only
+// (setup and handleSave), never the fetch task.
+static void skyActivate(bool on) {
+    if (on) {
+        if (!sky_begin()) { setError("Not enough memory for Sky"); return; }
+        ui_set_scope_mode(true);
+        scope_open(ui_screen());
+    } else {
+        scope_close();
+        ui_set_scope_mode(false);
+        sky_end();
+    }
+}
+
+// "41.9349" -> 41.9349f. false unless the whole (trimmed) string is a finite number within +-lim.
+static bool parseCoord(String v, float lim, float &out) {
+    v.trim();
+    if (!v.length()) return false;
+    const char *c = v.c_str();
+    char *end = nullptr;
+    const float f = strtof(c, &end);
+    if (end == c || *end != 0 || !isfinite(f) || f < -lim || f > lim) return false;
+    out = f;
+    return true;
+}
+
 // ------------------------------------------------------------------ wifi + setup portal
 static WiFiManager          g_wm;
 static WiFiManagerParameter g_wmKey("apikey", "FairKeep API key (bb_live_...), Etsy dial key, or status key (st_...)", "", 80);
+// WiFiManager writes value='{v}' before the custom attributes, so the default value "1" is
+// what a ticked box posts; an unticked one posts nothing and the value becomes "".
+static WiFiManagerParameter g_wmSky("sky", "Sky dial (no key needed)", "1", 2, "type='checkbox'", WFM_LABEL_AFTER);
+static WiFiManagerParameter g_wmLat("skylat", "Sky dial latitude (optional)", "", 12);
+static WiFiManagerParameter g_wmLon("skylon", "Sky dial longitude (optional)", "", 12);
 static bool                 g_portalSaved = false;
 static bool                 g_netUp = false;
 
 // A key from the setup hotspot: FairKeep keys start with bb_live_, status service keys
-// with st_, anything else is an Etsy dial service key.
+// with st_, anything else is an Etsy dial service key. The word "sky" picks a Sky dial.
 static void applyKey(String k) {
     k.trim();
     if (!k.length()) return;
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (k.startsWith("bb_live_"))  { g_set.fkKey = k; g_set.src = SRC_FAIRKEEP; }
+    if (k.equalsIgnoreCase("sky"))      { g_set.src = SRC_SKY; }
+    else if (k.startsWith("bb_live_"))  { g_set.fkKey = k; g_set.src = SRC_FAIRKEEP; }
     else if (k.startsWith("st_"))  { g_set.stKey = k; g_set.src = SRC_STATUS; }
     else                           { g_set.etKey = k; g_set.src = SRC_ETSY; }
     xSemaphoreGive(g_lock);
@@ -623,14 +822,15 @@ static void handleRoot() {
     xSemaphoreGive(g_lock);
 
     String status;
-    if (s.key().isEmpty())     status = "<span class=err>No key for this data source yet</span>";
+    if (s.src == SRC_SKY && !s.skyHasLoc())        status = "<span class=err>Set your location below</span>";
+    else if (s.src != SRC_SKY && s.key().isEmpty()) status = "<span class=err>No key for this data source yet</span>";
     else if (err.length())     status = "<span class=err>" + htmlEscape(err) + "</span>";
     else if (lastOk)           status = "<span class=ok>Connected</span> &middot; updated " + String((millis() - lastOk) / 1000) + "s ago";
     else                       status = "Waiting for first update&hellip;";
     if (warn.length()) status += "<br><span class=err>" + htmlEscape(warn) + "</span>";
 
     static const char *srcNames[SRC_COUNT] = { "FairKeep (today's POS + web sales)", "Etsy (via an Etsy dial service)",
-                                                "Server status (via a status service)" };
+                                                "Server status (via a status service)", "Sky (satellites overhead)" };
     static const char *fkNames[FK_COUNT] = { "Total (POS + web)", "POS only", "Web only", "All three" };
     static const char *etNames[ET_COUNT] = { "Today", "This month", "This year", "To ship" };
     static const char *stNames[ST_COUNT] = { "Everything", "Servers (CPU)" };
@@ -677,6 +877,22 @@ static void handleRoot() {
          "a dot round the edge for each. Servers = each Hetzner server with its CPU.</p>";
     p += "<label>Service URL</label><input name=stbase value='" + htmlEscape(s.stBase) + "'></div>";
 
+    {
+        static const char *rows[sky::SCR_COUNT] = { "Starlink", "NASA (ISS, Hubble, Landsat...)", "Spy satellites" };
+        p += "<div class=card><h2>Sky</h2>";
+        p += "<label>Latitude</label><input name=skylat inputmode=decimal value='" + (s.skyHasLoc() ? String(s.skyLat, 4) : String()) + "' placeholder='41.9349'>";
+        p += "<label>Longitude</label><input name=skylon inputmode=decimal value='" + (s.skyHasLoc() ? String(s.skyLon, 4) : String()) + "' placeholder='-71.3172'>";
+        p += "<p class=sub style='margin:6px 0 0'>Look yours up at <a style='color:#f2a93b' href='https://www.latlong.net/' target=_blank rel=noopener>latlong.net</a>. "
+             "Sent to the sky service rounded to 0.1&deg; (about 10 km).</p>";
+        for (int i = 0; i < sky::SCR_COUNT; ++i) {
+            if (i == sky::SCR_SPY && s.skyKey.isEmpty()) continue;
+            p += checkbox((String("skyon") + i).c_str(), s.skyOn >> i & 1, rows[i]);
+            p += "<label>Show objects above (degrees, 0&ndash;85)</label><input type=number min=0 max=85 name=skycut" + String(i) + " value=" + String(s.skyCut[i]) + ">";
+        }
+        p += "<label>Sky key (optional)</label>" + keyField("skykey", s.skyKey, "only if you were given one");
+        p += "<label>Sky service URL</label><input name=skybase value='" + htmlEscape(s.skyBase) + "'></div>";
+    }
+
     p += "<div class=card><label>Refresh every (seconds, " + String(MIN_POLL_S) + "&ndash;" + String(MAX_POLL_S) + ")</label>";
     p += "<input type=number name=poll min=" + String(MIN_POLL_S) + " max=" + String(MAX_POLL_S) + " value=" + String(s.pollS) + ">";
     p += "<label>Brightness</label><input type=range name=bright min=10 max=255 value=" + String(s.bright) + ">";
@@ -716,6 +932,33 @@ static void handleSave() {
     if (k.length()) g_set.etKey = k;
     k = g_web.arg("stkey"); k.trim();
     if (k.length()) g_set.stKey = k;
+    const bool  spyRowShown = g_set.skyKey.length() > 0;   // the page only had the Spy row with a key
+    const float oldLat = g_set.skyLat, oldLon = g_set.skyLon;
+    const uint8_t oldSkyOn = g_set.skyOn;
+    uint8_t oldCut[sky::SCR_COUNT];
+    memcpy(oldCut, g_set.skyCut, sizeof(oldCut));
+    k = g_web.arg("skykey"); k.trim();
+    if (k.length()) g_set.skyKey = k;
+    bool locBad = false;
+    if (g_web.hasArg("skylat") || g_web.hasArg("skylon")) {
+        String la = g_web.arg("skylat"), lo = g_web.arg("skylon");
+        la.trim(); lo.trim();
+        float fla, flo;
+        if (!la.length() && !lo.length())                                     { g_set.skyLat = g_set.skyLon = NAN; }
+        else if (parseCoord(la, 90, fla) && parseCoord(lo, 180, flo))         { g_set.skyLat = fla; g_set.skyLon = flo; }
+        else                                                                  locBad = true;   // keep the old pair
+    }
+    if (g_web.hasArg("skycut0")) {                         // the Sky card was on the page
+        for (int i = 0; i < sky::SCR_COUNT; ++i) {
+            if (i == sky::SCR_SPY && !spyRowShown) continue;
+            const String nm = String("skyon") + i;
+            if (g_web.hasArg(nm)) g_set.skyOn |= 1 << i; else g_set.skyOn &= ~(1 << i);
+        }
+        for (int i = 0; i < sky::SCR_COUNT; ++i) {
+            const String nm = String("skycut") + i;
+            if (g_web.hasArg(nm)) g_set.skyCut[i] = constrain(g_web.arg(nm).toInt(), 0, 85);
+        }
+    }
     if (g_web.hasArg("src"))    { const int v = g_web.arg("src").toInt(); g_set.src = v >= 0 && v < SRC_COUNT ? v : SRC_FAIRKEEP; }
     if (g_web.hasArg("stmode")) g_set.stMode = g_web.arg("stmode").toInt() % ST_COUNT;
     if (g_web.hasArg("fkmode")) g_set.fkMode = g_web.arg("fkmode").toInt() % FK_COUNT;
@@ -734,16 +977,24 @@ static void handleSave() {
     if (b.startsWith("https://")) g_set.etBase = b;
     b = g_web.arg("stbase"); b.trim();
     if (b.startsWith("https://")) g_set.stBase = b;
-    const bool changed = g_set.src != oldSrc || g_set.key() != oldKey || g_set.base() != oldBase;
+    b = g_web.arg("skybase"); b.trim();
+    if (b.startsWith("https://")) g_set.skyBase = b;
+    skyFixMode(g_set);
+    const bool sameLoc = (isnan(oldLat) && isnan(g_set.skyLat) && isnan(oldLon) && isnan(g_set.skyLon)) ||
+                         (oldLat == g_set.skyLat && oldLon == g_set.skyLon);
+    const bool skyChanged = g_set.src == SRC_SKY &&
+                            (!sameLoc || g_set.skyOn != oldSkyOn || memcmp(oldCut, g_set.skyCut, sizeof(oldCut)) != 0);
+    const bool changed = g_set.src != oldSrc || g_set.key() != oldKey || g_set.base() != oldBase || skyChanged;
     xSemaphoreGive(g_lock);
     saveSettings();
     if (changed) resetData();
+    if (changed && (oldSrc == SRC_SKY) != (g_set.src == SRC_SKY)) skyActivate(g_set.src == SRC_SKY);
     ui_set_cents(g_set.cents);
     if (!g_screenOff) display::setBrightness(g_set.bright);
     g_lastCycle = millis();
     renderView();
     g_fetchNow = true;
-    sendBack("Saved.");
+    sendBack(locBad ? "Saved, but the location was not valid." : "Saved.");
 }
 
 static void handlePin() {
@@ -821,8 +1072,19 @@ static void nextView() {
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_set.src == SRC_ETSY)        g_set.etMode = (g_set.etMode + 1) % ET_COUNT;
     else if (g_set.src == SRC_STATUS) g_set.stMode = (g_set.stMode + 1) % ST_COUNT;
+    else if (g_set.src == SRC_SKY)    g_set.skyMode = skyNextEnabled(g_set, g_set.skyMode);
     else                              g_set.fkMode = (g_set.fkMode + 1) % FK_COUNT;
+    const bool sky = g_set.src == SRC_SKY;
+    const int  skyMode = g_set.skyMode;
     xSemaphoreGive(g_lock);
+    if (sky) {
+        // Fetch only if the reply on hand does not carry this screen (auto-cycle fetches the next one ahead).
+        sky_lock();
+        const sky::Reply *rp = sky_reply();
+        const bool inReply = rp && rp->scr[skyMode].state != sky::ST_NONE;
+        sky_unlock();
+        if (!inReply) g_fetchNow = true;
+    }
     renderView();
 }
 
@@ -852,7 +1114,7 @@ static void showMenu() {
     } else {
         strlcpy(m.wifi, "setup hotspot: " SETUP_AP_NAME, sizeof(m.wifi));
     }
-    static const char *srcShort[SRC_COUNT] = { "FairKeep", "Etsy", "Server status" };
+    static const char *srcShort[SRC_COUNT] = { "FairKeep", "Etsy", "Server status", "Sky" };
     snprintf(m.line, sizeof(m.line), "v" FW_VERSION "  -  %s  -  PIN %s", srcShort[g_set.src], g_set.pin.c_str());
     m.brightPct = (g_set.bright * 100 + 127) / 255;
     m.cycleSec = g_set.cycleOn ? g_set.cycleS : 0;
@@ -912,14 +1174,24 @@ static void refreshScreenState() {
     err = g_err; warn = g_warn; lastOk = g_lastOkMs; key = g_set.key();
     have = g_set.src == SRC_ETSY ? g_et.have : g_set.src == SRC_STATUS ? g_st.have : g_fk.have;
     const uint8_t src = g_set.src;
+    const bool hasLoc = g_set.skyHasLoc();
     xSemaphoreGive(g_lock);
+    if (src == SRC_SKY) { sky_lock(); have = sky_reply() != nullptr; sky_unlock(); }   // after g_lock is released
 
     if (!g_netUp) {
         ui_set_message("Set up WiFi", "On your phone, join\n" SETUP_AP_NAME "\nthen pick your network and paste your dial key.");
         ui_set_status("", false);
+        scope_set_visible(false);
         return;
     }
-    if (key.isEmpty()) {
+    if (src == SRC_SKY && !hasLoc) {
+        String body = "at http://" + WiFi.localIP().toString() + "/\n(deskdial.local)";
+        ui_set_message("Set your location", body.c_str());
+        ui_set_status("", false);
+        scope_set_visible(false);
+        return;
+    }
+    if (src != SRC_SKY && key.isEmpty()) {
         String body = "Open http://" + WiFi.localIP().toString() + "/\non this WiFi and paste your " +
                       (src == SRC_ETSY ? "Etsy dial service key." : src == SRC_STATUS ? "status service key." : "FairKeep API key.");
         ui_set_message("Add key", body.c_str());
@@ -928,11 +1200,14 @@ static void refreshScreenState() {
     }
     if (!have && err.length()) {
         String body = err + "\n\nSettings: http://" + WiFi.localIP().toString() + "/";
-        ui_set_message(src == SRC_ETSY ? "Can't load Etsy" : src == SRC_STATUS ? "Can't load status" : "Can't load sales", body.c_str());
+        ui_set_message(src == SRC_ETSY ? "Can't load Etsy" : src == SRC_STATUS ? "Can't load status"
+                       : src == SRC_SKY ? "Can't load the sky" : "Can't load sales", body.c_str());
         ui_set_status("", false);
+        scope_set_visible(false);
         return;
     }
     ui_set_message(nullptr, nullptr);
+    scope_set_visible(true);
 
     char line[96];
     if (err.length()) {
@@ -970,10 +1245,12 @@ void setup() {
     battery_begin();
     display::setBrightness(g_set.bright);
     ui_create(onTap, onLongPress);
+    if (g_set.src == SRC_SKY) skyActivate(true);
     ui_menu_set_callback(onMenu);
     ui_set_cents(g_set.cents);
     renderView();
     ui_set_message("VARO Desk Dial", "Connecting to WiFi...");
+    scope_set_visible(false);
     display::loop();
 
     // Setup hotspot: non-blocking so the screen keeps drawing while it is open.
@@ -984,6 +1261,9 @@ void setup() {
     g_wm.setConfigPortalBlocking(false);
     g_wm.setConnectTimeout(20);
     g_wm.addParameter(&g_wmKey);
+    g_wm.addParameter(&g_wmSky);
+    g_wm.addParameter(&g_wmLat);
+    g_wm.addParameter(&g_wmLon);
     g_wm.setSaveConfigCallback([] { g_portalSaved = true; });
     g_wm.setCustomHeadElement(
         "<style>body{background:#0b1424;color:#f4ebdd}button{background:#f2a93b;color:#0b1424}"
@@ -1006,6 +1286,16 @@ void loop() {
         g_wm.process();
         if (g_portalSaved) {
             applyKey(String(g_wmKey.getValue()));
+            {
+                String k = g_wmKey.getValue(); k.trim();
+                float la, lo;
+                xSemaphoreTake(g_lock, portMAX_DELAY);
+                if (!k.length() && !strcmp(g_wmSky.getValue(), "1")) g_set.src = SRC_SKY;   // a typed key wins
+                if (parseCoord(g_wmLat.getValue(), 90, la) && parseCoord(g_wmLon.getValue(), 180, lo)) {
+                    g_set.skyLat = la; g_set.skyLon = lo;
+                }
+                xSemaphoreGive(g_lock);
+            }
             saveSettings();
             Serial.println("[wifi] saved from setup page -> restarting");
             ui_set_message("Saved", "Restarting...");
@@ -1040,6 +1330,12 @@ void loop() {
         millis() - g_lastCycle >= (uint32_t)g_set.cycleS * 1000) {
         g_lastCycle = millis();
         nextView();
+    }
+
+    static uint32_t lastFrame = 0;
+    if (g_set.src == SRC_SKY && scope_is_open() && !g_screenOff && !ui_menu_open() && millis() - lastFrame >= 200) {
+        lastFrame = millis();
+        skyFrame();
     }
 
     delay(5);
