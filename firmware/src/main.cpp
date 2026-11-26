@@ -769,10 +769,10 @@ static void skyFrame() {
             n = 0;
         } else if (id == sky::SCR_BRIGHT && s->dark == 0) {          // daylight or twilight: nothing to see
             n = 0;
-            snprintf(l1, sizeof(l1), "Too bright out.");
+            snprintf(l1, sizeof(l1), "Too bright out. Next visible:");
             char nx[96] = "none in the next 24 h";
             if (s->next.have) sky::next_text(nx, sizeof(nx), s->next);
-            snprintf(l2, sizeof(l2), "Next visible: %s", nx);
+            snprintf(l2, sizeof(l2), "%s", nx);
         } else if (best < 0 && id == sky::SCR_PLANETS) {
             if (cut == 0) snprintf(l1, sizeof(l1), "nothing above the horizon");
             else          snprintf(l1, sizeof(l1), "nothing above %d deg", cut);
