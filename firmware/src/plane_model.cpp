@@ -142,6 +142,61 @@ bool route_text(const char *json, size_t len, char *out, size_t n) {
     return true;
 }
 
+namespace {
+struct Carrier { char code[4]; const char *name; uint32_t rgb; };
+const Carrier CARRIERS[] = {
+    { "AAL", "American", 0xC8CED6 },        { "DAL", "Delta", 0xE01933 },
+    { "UAL", "United", 0x2F6FE0 },          { "SWA", "Southwest", 0xF9B612 },
+    { "JBU", "JetBlue", 0x1E7BFF },         { "ASA", "Alaska", 0x00A0B0 },
+    { "NKS", "Spirit", 0xFFE800 },          { "FFT", "Frontier", 0x2E9E4F },
+    { "HAL", "Hawaiian", 0xB43C96 },        { "AAY", "Allegiant", 0xF58220 },
+    { "SKW", "SkyWest", 0x6E8FB8 },         { "RPA", "Republic", 0x8C7AD9 },
+    { "ENY", "Envoy", 0x9BB4D6 },           { "EDV", "Endeavor", 0xD9668C },
+    { "JIA", "PSA", 0x7FA7D9 },             { "FDX", "FedEx", 0x8A4FD8 },
+    { "UPS", "UPS", 0xA0743C },             { "ACA", "Air Canada", 0xE8312F },
+    { "BAW", "British Airways", 0x2B5BA8 }, { "DLH", "Lufthansa", 0xF2B705 },
+    { "AFR", "Air France", 0x2C4AA0 },      { "KLM", "KLM", 0x00A1DE },
+    { "UAE", "Emirates", 0xD71921 },        { "ICE", "Icelandair", 0x4B7BC4 },
+    { "AIC", "Air India", 0xE2552C },       { "QTR", "Qatar", 0x8D1B3D },
+    { "VIR", "Virgin", 0xE10A0A },          { "IBE", "Iberia", 0xD7192D },
+    { "AZA", "ITA", 0x1E5AA8 },             { "TAP", "TAP", 0x3DAE2B },
+    { "EIN", "Aer Lingus", 0x3FAE49 },      { "WJA", "WestJet", 0x23A3B5 },
+    { "MXY", "Breeze", 0x4FA3E0 },          { "GJS", "GoJet", 0x7C9BB8 },
+    { "CPZ", "Compass", 0x8FA7C4 },         { "SCX", "Sun Country", 0xF0A030 },
+    { "QXE", "Horizon", 0x3C9BB0 },         { "GTI", "Atlas", 0x7A8AA6 },
+    { "ABX", "ABX", 0x9A8A6A },
+};
+// Saturated, clear of the GA grey and of every theme's hilite (marigold, pale green, pale amber, white).
+const uint32_t PALETTE[12] = { 0xE6194B, 0x3CB44B, 0x4363D8, 0xFF6F61, 0x911EB4, 0x46F0F0,
+                               0xF032E6, 0xBCF60C, 0x00A3A3, 0xB48CFF, 0x9A6324, 0x7FFFB0 };
+}  // namespace
+
+bool carrier(const char *cs, char *code4, const char **name, uint32_t *rgb) {
+    if (code4) code4[0] = 0;
+    if (name) *name = nullptr;
+    if (rgb) *rgb = GA_GREY;
+    if (!cs) return false;
+    char c[4];
+    for (int i = 0; i < 3; ++i) {
+        const char ch = (char)toupper((unsigned char)cs[i]);
+        if (ch < 'A' || ch > 'Z') return false;    // also stops at the NUL of a short callsign
+        c[i] = ch;
+    }
+    if (cs[3] < '0' || cs[3] > '9') return false;
+    c[3] = 0;
+    if (code4) memcpy(code4, c, 4);
+    for (const Carrier &k : CARRIERS)
+        if (!memcmp(k.code, c, 4)) {
+            if (name) *name = k.name;
+            if (rgb) *rgb = k.rgb;
+            return true;
+        }
+    uint32_t h = 2166136261u;                       // FNV-1a, 32 bit
+    for (int i = 0; i < 3; ++i) { h ^= (uint8_t)c[i]; h *= 16777619u; }
+    if (rgb) *rgb = PALETTE[h % 12];
+    return true;
+}
+
 static int64_t day_of(int64_t ms) { return ms - ((ms % DAY_MS) + DAY_MS) % DAY_MS; }
 
 int32_t Budget::wait_s(int64_t now) {

@@ -97,6 +97,26 @@ static void test_budget() {
     TEST_ASSERT_EQUAL(30, d.wait_s(noon));           // never under 30 s
 }
 
+static void test_carrier() {
+    char code[4]; const char *name = nullptr; uint32_t rgb = 0;
+    TEST_ASSERT_TRUE(carrier("JBU1234", code, &name, &rgb));
+    TEST_ASSERT_EQUAL_STRING("JBU", code);
+    TEST_ASSERT_EQUAL_STRING("JetBlue", name);
+    TEST_ASSERT_EQUAL_HEX32(0x1E7BFF, rgb);
+    TEST_ASSERT_FALSE(carrier("N123AB", code, &name, &rgb));            // general aviation
+    TEST_ASSERT_EQUAL_HEX32(GA_GREY, rgb);
+    TEST_ASSERT_FALSE(carrier("", code, &name, &rgb));
+    TEST_ASSERT_EQUAL_HEX32(GA_GREY, rgb);
+    uint32_t a = 0, b = 0;
+    TEST_ASSERT_TRUE(carrier("XYZ123", code, &name, &a));                // not in the table: hashed colour
+    TEST_ASSERT_EQUAL_STRING("XYZ", code);
+    TEST_ASSERT_NULL(name);
+    TEST_ASSERT_TRUE(carrier("XYZ123", code, &name, &b));
+    TEST_ASSERT_EQUAL_HEX32(a, b);                                       // stable
+    TEST_ASSERT_NOT_EQUAL(GA_GREY, a);
+    TEST_ASSERT_NOT_EQUAL(0u, a);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_parse_sample);
@@ -104,5 +124,6 @@ int main(int, char **) {
     RUN_TEST(test_dead_reckon_and_project);
     RUN_TEST(test_readout_and_route);
     RUN_TEST(test_budget);
+    RUN_TEST(test_carrier);
     return UNITY_END();
 }

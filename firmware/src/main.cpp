@@ -76,6 +76,8 @@ struct Settings {
     String   plUrl = DEFAULT_PLANE_URL, plKey;
     uint32_t plDay = 500;                  // requests/day, 50..100000
     uint16_t north = 0;                    // which way the top of the dial faces, 0..359
+    uint8_t  theme = TH_NIGHT;             // scope colour scheme
+    bool     plColor = true;               // colour planes by airline
 
     const String &key() const  { return src == SRC_ETSY ? etKey : src == SRC_STATUS ? stKey : src == SRC_SKY ? skyKey : fkKey; }
     const String &base() const { return src == SRC_ETSY ? etBase : src == SRC_STATUS ? stBase : src == SRC_SKY ? skyBase : fkBase; }
@@ -148,6 +150,8 @@ static void loadSettings() {
     g_set.plKey    = g_prefs.getString("pkey", "");
     g_set.plDay    = constrain(g_prefs.getUInt("pday", 500), 50u, 100000u);
     g_set.north    = g_prefs.getUShort("north", 0) % 360;
+    g_set.theme    = g_prefs.getUChar("theme", TH_NIGHT) % TH_COUNT;
+    g_set.plColor  = g_prefs.getBool("pcolor", true);
     skyFixMode(g_set);
     g_prefs.end();
 }
@@ -188,6 +192,8 @@ static void saveSettings() {
     g_prefs.putString("pkey", g_set.plKey);
     g_prefs.putUInt("pday", g_set.plDay);
     g_prefs.putUShort("north", g_set.north);
+    g_prefs.putUChar("theme", g_set.theme);
+    g_prefs.putBool("pcolor", g_set.plColor);
     g_prefs.end();
 }
 
@@ -705,7 +711,7 @@ static void skyFrame() {
             if (!sky::project(az, el, cut, SCOPE_R, x, y)) continue;   // below the cutoff: hidden
             sky::rotate(x, y, north);
             ScopeDot &d = dots[n];
-            d.x = x; d.y = y; d.ntail = 0;
+            d.x = x; d.y = y; d.ntail = 0; d.rgb = 0;
             for (int k = 0; k < 2; ++k) {
                 float a2, e2; int x2, y2;
                 if (sky::position(o, t - 6.f * (k + 1), a2, e2) && sky::project(a2, e2, cut, SCOPE_R, x2, y2)) {
@@ -761,6 +767,8 @@ static void planeFrame() {
     const char *un = unitName(units);
     const double oLat = g_set.skyLat, oLon = g_set.skyLon;
     const bool keyed = g_set.skyKey.length() > 0;
+    const bool colour = g_set.plColor;
+    const uint32_t gaGrey = g_set.theme == TH_MONO ? planes::GA_GREY_MONO : planes::GA_GREY;
     const int rDisp = (int)lroundf(radiusNm * perNm);
     {
         char a[12], b[12], c[16];
@@ -788,7 +796,11 @@ static void planeFrame() {
             if (!planes::project(oLat, oLon, la, lo, radiusNm, SCOPE_R, x, y)) continue;   // outside the rim
             sky::rotate(x, y, north);
             ScopeDot &d = dots[n];
-            d.x = x; d.y = y; d.ntail = 0;
+            d.x = x; d.y = y; d.ntail = 0; d.rgb = 0;
+            if (colour) {
+                uint32_t rgb;
+                d.rgb = planes::carrier(a.flight, nullptr, nullptr, &rgb) ? rgb : gaGrey;
+            }
             for (int k = 0; k < 2; ++k) {
                 double la2, lo2; int x2, y2;
                 planes::dead_reckon(a, dt - 10.f * (k + 1), la2, lo2);
@@ -814,6 +826,12 @@ static void planeFrame() {
         } else {
             dots[best].style |= SD_HILITE;
             planes::readout(l1, sizeof(l1), l2, sizeof(l2), near, (planes::Units)units);
+            const char *cname = nullptr;
+            if (planes::carrier(near.flight, nullptr, &cname, nullptr) && cname) {   // "JetBlue  JBU1234  A320"
+                char t[sizeof(l1)];
+                snprintf(t, sizeof(t), "%s  %s", cname, l1);
+                strlcpy(l1, t, sizeof(l1));
+            }
             if (keyed && near.flight[0]) {        // routes only on key-holding dials (planes_route_* lock themselves)
                 if (strcmp(g_routeWanted, near.flight)) {
                     strlcpy(g_routeWanted, near.flight, sizeof(g_routeWanted));
@@ -848,6 +866,7 @@ static void skyActivate(bool on) {
         g_plReady = planes_begin();            // Planes alone may fail; the sky screens still work
         if (!g_plReady) g_plErr = PL_NO_MEMORY;
         ui_set_scope_mode(true);
+        scope_set_theme(g_set.theme);
         scope_open(ui_screen());
         if (ui_menu_open()) ui_menu_hide();   // the scope is created above the menu
     } else {
@@ -1074,11 +1093,17 @@ static void handleRoot() {
                  " max=" + String((int)lroundf(100 * f)) + " value=" + String((int)lroundf(s.plRadius * f)) + ">";
             p += "<input type=hidden name=punitsold value=" + String(s.plUnits) + ">";
             p += "<label>Units</label><select name=punits>" + options(unitNames, 3, s.plUnits) + "</select>";
+            p += checkbox("pcolor", s.plColor, "Colour planes by airline");
         }
         for (int i = 0; i < sky::SCR_COUNT; ++i) {
             if (i == sky::SCR_SPY && s.skyKey.isEmpty()) continue;
             p += checkbox((String("skyon") + i).c_str(), s.skyOn >> i & 1, rows[i]);
             p += "<label>Show objects above (degrees, 0&ndash;85)</label><input type=number min=0 max=85 name=skycut" + String(i) + " value=" + String(s.skyCut[i]) + ">";
+        }
+        {
+            const char *themes[TH_COUNT];
+            for (int i = 0; i < TH_COUNT; ++i) themes[i] = SCOPE_THEMES[i].name;
+            p += "<label>Scope colours</label><select name=theme>" + options(themes, TH_COUNT, s.theme) + "</select>";
         }
         p += "<label>North offset (degrees, 0&ndash;359)</label><input type=number min=0 max=359 name=north value=" + String(s.north) + ">";
         p += "<p class=sub style='margin:6px 0 0'>Which way the top of the dial faces, in degrees clockwise from north (0 = north, 90 = east). "
@@ -1159,14 +1184,16 @@ static void handleSave() {
             if (g_web.hasArg(nm)) g_set.skyCut[i] = constrain(g_web.arg(nm).toInt(), 0, 85);
         }
         g_set.plOn = g_web.hasArg("plon");
+        g_set.plColor = g_web.hasArg("pcolor");
     }
     if (g_web.hasArg("pradius")) {                         // typed in the units the page showed
-        const uint8_t shownUnits = g_web.hasArg("punitsold") ? g_web.arg("punitsold").toInt() % 3 : g_set.plUnits;
+        const uint8_t shownUnits = g_web.hasArg("punitsold") ? constrain(g_web.arg("punitsold").toInt(), 0L, 2L) : g_set.plUnits;
         const float v = g_web.arg("pradius").toFloat() / unitPerNm(shownUnits);
         g_set.plRadius = constrain((int)lroundf(v), 5, 100);
     }
-    if (g_web.hasArg("punits")) g_set.plUnits = g_web.arg("punits").toInt() % 3;
+    if (g_web.hasArg("punits")) g_set.plUnits = constrain(g_web.arg("punits").toInt(), 0L, 2L);
     if (g_web.hasArg("pday"))   g_set.plDay = constrain(g_web.arg("pday").toInt(), 50L, 100000L);
+    if (g_web.hasArg("theme"))  g_set.theme = constrain(g_web.arg("theme").toInt(), 0L, (long)TH_COUNT - 1);
     if (g_web.hasArg("north"))  g_set.north = constrain(g_web.arg("north").toInt(), 0L, 359L);
     if (g_web.hasArg("src"))    { const int v = g_web.arg("src").toInt(); g_set.src = v >= 0 && v < SRC_COUNT ? v : SRC_FAIRKEEP; }
     if (g_web.hasArg("stmode")) g_set.stMode = g_web.arg("stmode").toInt() % ST_COUNT;
@@ -1201,6 +1228,7 @@ static void handleSave() {
     if (changed) resetData();
     if (changed && (oldSrc == SRC_SKY) != (g_set.src == SRC_SKY)) skyActivate(g_set.src == SRC_SKY);
     ui_set_cents(g_set.cents);
+    scope_set_theme(g_set.theme);              // repaints the scope if it is open
     if (!g_screenOff) display::setBrightness(g_set.bright);
     g_lastCycle = millis();
     renderView();

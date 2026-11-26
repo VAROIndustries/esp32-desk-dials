@@ -37,6 +37,15 @@ void readout(char *l1, size_t n1, char *l2, size_t n2, const Aircraft &a, Units 
 // Route text from an adsbdb callsign reply: "SJU - MCO" (IATA, else ICAO). false = no route.
 bool route_text(const char *json, size_t len, char *out, size_t n);
 
+// Carrier colours. carrier = the first 3 characters of the callsign when they are 3 letters
+// followed by a digit (ICAO airline designator: "JBU1234" -> "JBU"). Known designators give a
+// short name and a livery-ish colour; other designators a stable colour from a 12-colour
+// palette (FNV-1a of the 3 letters) and name nullptr. Anything else is general aviation:
+// returns false, code4 "", name nullptr, rgb GA_GREY. code4 holds 4 bytes.
+constexpr uint32_t GA_GREY      = 0x9AA0A6;
+constexpr uint32_t GA_GREY_MONO = 0x6E6E6E;       // on the Mono scope theme
+bool carrier(const char *callsign, char *code4, const char **name, uint32_t *rgb);
+
 // Daily request budget (adsb.lol resets at 00:00 UTC). Times are UTC milliseconds.
 struct Budget {
     uint16_t perDay = 500;

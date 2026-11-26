@@ -16,12 +16,23 @@ static bool      s_tails = SCOPE_TAILS;
 static int       s_north = 0;
 static char      s_ringLbl[3][12] = { "", "", "" };   // inner, mid, outer
 
-#define C_BG       lv_color_hex(0x0B1424)
-#define C_RINGLINE lv_color_hex(0x1E2A40)
-#define C_DIM      lv_color_hex(0x8A93A6)
-#define C_CREAM    lv_color_hex(0xF4EBDD)
-#define C_MARIGOLD lv_color_hex(0xF2A93B)
-#define C_DOT      lv_color_hex(0x7DD3FC)
+#define C_BG       lv_color_hex(0x0B1424)      // the dial's own background (ui.cpp)
+
+//                                       name           bg        ring      dot       letters   hilite    header    text
+const ScopeTheme SCOPE_THEMES[TH_COUNT] = {
+    { "Night",       0x0B1424, 0x1E2A40, 0x7DD3FC, 0x8A93A6, 0xF2A93B, 0xF2A93B, 0xF4EBDD },
+    { "Radar green", 0x000000, 0x0F3D1E, 0x39FF6A, 0x2FAF55, 0xE8FFE8, 0x39FF6A, 0xE8FFE8 },
+    { "Amber",       0x000000, 0x3A2600, 0xFFB000, 0xB07A00, 0xFFF1C2, 0xFFB000, 0xFFF1C2 },
+    { "Ice",         0x061424, 0x16324A, 0x7FE7FF, 0x7FA8C9, 0xFFFFFF, 0x7FE7FF, 0xFFFFFF },
+    { "Mono",        0x000000, 0x2A2A2A, 0xE6E6E6, 0x8C8C8C, 0xFFFFFF, 0xE6E6E6, 0xFFFFFF },
+};
+static int s_theme = TH_NIGHT;
+static lv_obj_t *s_parent = nullptr;
+static inline const ScopeTheme &TH() { return SCOPE_THEMES[s_theme]; }
+#define C_RINGLINE lv_color_hex(TH().ring)
+#define C_DIM      lv_color_hex(TH().letters)
+#define C_DOT      lv_color_hex(TH().dot)
+#define C_HILITE   lv_color_hex(TH().hilite)
 
 static void draw_cb(lv_event_t *e) {
     lv_draw_ctx_t *ctx = lv_event_get_draw_ctx(e);
@@ -56,13 +67,15 @@ static void draw_cb(lv_event_t *e) {
     }
 
     lv_draw_line_dsc_t tail; lv_draw_line_dsc_init(&tail);
-    tail.color = C_DOT; tail.width = 2; tail.opa = LV_OPA_50; tail.round_end = 1;
+    tail.width = 2; tail.opa = LV_OPA_50; tail.round_end = 1;
     lv_draw_rect_dsc_t dot; lv_draw_rect_dsc_init(&dot);
     dot.radius = LV_RADIUS_CIRCLE;
     const int n = s_n < SCOPE_MAX_DOTS ? s_n : SCOPE_MAX_DOTS;
     for (int i = 0; i < n; ++i) {
         const ScopeDot &d = s_dots[i];
         lv_point_t p0 = { (lv_coord_t)(cx + d.x), (lv_coord_t)(cy + d.y) };
+        const lv_color_t base = d.rgb ? lv_color_hex(d.rgb) : C_DOT;
+        tail.color = base;
         if (s_tails) {
             lv_point_t prev = p0;
             for (int k = 0; k < d.ntail; ++k) {
@@ -71,12 +84,21 @@ static void draw_cb(lv_event_t *e) {
                 prev = p1;
             }
         }
-        const int r = d.style & SD_HILITE ? 7 : 5;
+        const bool hi = d.style & SD_HILITE;
+        const int r = hi ? 7 : 5;
         lv_area_t da = { (lv_coord_t)(p0.x - r), (lv_coord_t)(p0.y - r), (lv_coord_t)(p0.x + r), (lv_coord_t)(p0.y + r) };
-        const lv_color_t col = d.style & SD_HILITE ? C_MARIGOLD : C_DOT;
+        const lv_color_t col = hi && !d.rgb ? C_HILITE : base;   // coloured dots keep their colour
         if (d.style & SD_HOLLOW) { dot.bg_opa = LV_OPA_TRANSP; dot.border_color = col; dot.border_width = 2; dot.border_opa = LV_OPA_COVER; }
         else                     { dot.bg_opa = LV_OPA_COVER; dot.bg_color = col; dot.border_width = 0; }
         lv_draw_rect(ctx, &dot, &da);
+        if (hi && d.rgb) {                           // ...and get a white ring
+            const int rr = r + 4;
+            lv_area_t ra = { (lv_coord_t)(p0.x - rr), (lv_coord_t)(p0.y - rr), (lv_coord_t)(p0.x + rr), (lv_coord_t)(p0.y + rr) };
+            lv_draw_rect_dsc_t ring2; lv_draw_rect_dsc_init(&ring2);
+            ring2.radius = LV_RADIUS_CIRCLE; ring2.bg_opa = LV_OPA_TRANSP;
+            ring2.border_color = lv_color_white(); ring2.border_width = 2; ring2.border_opa = LV_OPA_COVER;
+            lv_draw_rect(ctx, &ring2, &ra);
+        }
     }
 }
 
@@ -101,18 +123,21 @@ void scope_open(lv_obj_t *parent) {
     lv_obj_align(s_obj, LV_ALIGN_CENTER, 0, -18);
     lv_obj_clear_flag(s_obj, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
     lv_obj_add_event_cb(s_obj, draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
-    s_hdr  = mk_label(parent, &lv_font_montserrat_16, C_MARIGOLD, -196);
+    s_hdr  = mk_label(parent, &lv_font_montserrat_16, lv_color_hex(TH().header), -196);
     lv_obj_set_style_text_letter_space(s_hdr, 2, 0);
-    s_l1   = mk_label(parent, &lv_font_montserrat_20, C_CREAM, 128);
+    s_l1   = mk_label(parent, &lv_font_montserrat_20, lv_color_hex(TH().text), 128);
     s_l2   = mk_label(parent, &lv_font_montserrat_16, C_DIM, 152);
     s_foot = mk_label(parent, &lv_font_montserrat_14, C_DIM, 196);
+    s_parent = parent;
+    lv_obj_set_style_bg_color(parent, lv_color_hex(TH().bg), 0);
     s_n = 0;
 }
 
 void scope_close() {
     if (!s_obj) return;
     lv_obj_del(s_obj); lv_obj_del(s_hdr); lv_obj_del(s_l1); lv_obj_del(s_l2); lv_obj_del(s_foot);
-    s_obj = nullptr; s_n = 0;
+    if (s_parent) lv_obj_set_style_bg_color(s_parent, C_BG, 0);   // back to the dial's navy
+    s_obj = nullptr; s_parent = nullptr; s_n = 0;
 }
 
 bool scope_is_open() { return s_obj != nullptr; }
@@ -162,4 +187,17 @@ void scope_set_ring_labels(const char *inner, const char *mid, const char *outer
         if (strncmp(s_ringLbl[k], v, sizeof(s_ringLbl[k]) - 1)) { strlcpy(s_ringLbl[k], v, sizeof(s_ringLbl[k])); diff = true; }
     }
     if (diff && s_obj) lv_obj_invalidate(s_obj);
+}
+
+void scope_set_theme(int theme) {
+    if (theme < 0 || theme >= TH_COUNT) theme = TH_NIGHT;
+    if (theme == s_theme) return;
+    s_theme = theme;
+    if (!s_obj) return;
+    lv_obj_set_style_bg_color(s_parent, lv_color_hex(TH().bg), 0);
+    lv_obj_set_style_text_color(s_hdr, lv_color_hex(TH().header), 0);
+    lv_obj_set_style_text_color(s_l1, lv_color_hex(TH().text), 0);
+    lv_obj_set_style_text_color(s_l2, C_DIM, 0);
+    lv_obj_set_style_text_color(s_foot, C_DIM, 0);
+    lv_obj_invalidate(s_obj);
 }
