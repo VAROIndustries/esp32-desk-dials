@@ -5,7 +5,7 @@
 // verified it against ESPHome, xiaozhi-esp32 and the Waveshare schematic.
 
 #define FW_NAME             "VARO Desk Dial"
-#define FW_VERSION          "1.4.0-beta1"
+#define FW_VERSION          "1.4.0-beta2"
 #define BOARD_NAME          "ESP32-S3-Touch-AMOLED-1.75"
 
 #define SCREEN_W            466

@@ -13,6 +13,8 @@ static lv_obj_t *s_obj = nullptr, *s_hdr, *s_l1, *s_l2, *s_foot;
 static ScopeDot  s_dots[sky::MAX_OBJ];
 static int       s_n = 0;
 static bool      s_tails = SCOPE_TAILS;
+static int       s_north = 0;
+static char      s_ringLbl[3][12] = { "", "", "" };   // inner, mid, outer
 
 #define C_BG       lv_color_hex(0x0B1424)
 #define C_RINGLINE lv_color_hex(0x1E2A40)
@@ -37,9 +39,20 @@ static void draw_cb(lv_event_t *e) {
     static const char *nesw[4] = { "N", "E", "S", "W" };
     static const int dx[4] = { 0, 1, 0, -1 }, dy[4] = { -1, 0, 1, 0 };
     for (int i = 0; i < 4; ++i) {
-        lv_area_t t = { (lv_coord_t)(cx + dx[i] * (SCOPE_R + 14) - 8), (lv_coord_t)(cy + dy[i] * (SCOPE_R + 14) - 9),
-                        (lv_coord_t)(cx + dx[i] * (SCOPE_R + 14) + 8), (lv_coord_t)(cy + dy[i] * (SCOPE_R + 14) + 9) };
+        int lx = dx[i] * (SCOPE_R + 14), ly = dy[i] * (SCOPE_R + 14);
+        sky::rotate(lx, ly, s_north);              // the letter moves; its text stays upright
+        lv_area_t t = { (lv_coord_t)(cx + lx - 8), (lv_coord_t)(cy + ly - 9),
+                        (lv_coord_t)(cx + lx + 8), (lv_coord_t)(cy + ly + 9) };
         lv_draw_label(ctx, &lbl, &t, nesw[i], nullptr);
+    }
+    // ring labels: right-aligned, bottom-right corner just inside each ring on the lower-right diagonal
+    lv_draw_label_dsc_t rl; lv_draw_label_dsc_init(&rl);
+    rl.color = C_DIM; rl.font = &lv_font_montserrat_14; rl.align = LV_TEXT_ALIGN_RIGHT; rl.opa = LV_OPA_80;
+    for (int k = 0; k < 3; ++k) {
+        if (!s_ringLbl[k][0]) continue;
+        const int r = SCOPE_R * (k + 1) / 3 - 4, q = (int)(r * 0.7071f);
+        lv_area_t t = { (lv_coord_t)(cx + q - 60), (lv_coord_t)(cy + q - 16), (lv_coord_t)(cx + q), (lv_coord_t)(cy + q) };
+        lv_draw_label(ctx, &rl, &t, s_ringLbl[k], nullptr);
     }
 
     lv_draw_line_dsc_t tail; lv_draw_line_dsc_init(&tail);
@@ -131,4 +144,22 @@ void scope_set_visible(bool on) {
         if (on) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
         else    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+void scope_set_north(int offsetDeg) {
+    offsetDeg %= 360;
+    if (offsetDeg < 0) offsetDeg += 360;
+    if (offsetDeg == s_north) return;
+    s_north = offsetDeg;
+    if (s_obj) lv_obj_invalidate(s_obj);
+}
+
+void scope_set_ring_labels(const char *inner, const char *mid, const char *outer) {
+    const char *in[3] = { inner, mid, outer };
+    bool diff = false;
+    for (int k = 0; k < 3; ++k) {
+        const char *v = in[k] ? in[k] : "";
+        if (strncmp(s_ringLbl[k], v, sizeof(s_ringLbl[k]) - 1)) { strlcpy(s_ringLbl[k], v, sizeof(s_ringLbl[k])); diff = true; }
+    }
+    if (diff && s_obj) lv_obj_invalidate(s_obj);
 }

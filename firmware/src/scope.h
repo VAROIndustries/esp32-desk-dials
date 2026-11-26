@@ -20,3 +20,9 @@ void scope_set_dots(const ScopeDot *d, int n);   // n <= sky::MAX_OBJ; invalidat
 void scope_set_text(const char *header, const char *line1, const char *line2, const char *footer);
 void scope_set_tails(bool on);                // gate fallback 2
 void scope_set_visible(bool on);              // hide/show the scope and its labels (no-op if not open)
+// North offset (0..359, the direction the top of the dial faces, clockwise from north): the
+// N/E/S/W letters move round the rim (they stay upright). Dots arrive already rotated
+// (sky::rotate). Rings are circles, so they do not change. Kept across scope_open/close.
+void scope_set_north(int offsetDeg);
+// Small dim labels just inside each ring (map view, e.g. "8", "17", "25 nm"); "" = none (sky view).
+void scope_set_ring_labels(const char *inner, const char *mid, const char *outer);

@@ -7,7 +7,8 @@
 //             views: Today / Month / Year; gross by default, optionally after Etsy fees
 //             (and optionally after postage labels too)
 //   Sky       GET {skyBase}/v1/sky       (no key; a sky key opens the Spy screen)
-//             screens: Starlink / NASA / Spy, drawn as a scope with moving dots
+//             + GET {plUrl}/<lat>/<lon>/<radius> (adsb.lol, on a daily request budget)
+//             screens: Planes / Starlink / NASA / Spy, drawn as a scope with moving dots
 // Setup: first boot opens the DeskDial-Setup hotspot (WiFi + key). Afterwards
 // everything is on http://deskdial.local/ (or the dial's IP).
 // Touch: tap = next view (unless the view is locked), long-press = settings screen
@@ -31,6 +32,7 @@
 #include "battery.h"
 #include "ui.h"
 #include "sky.h"
+#include "planes.h"
 #include "scope.h"
 #include <math.h>
 
@@ -38,6 +40,11 @@ enum Source : uint8_t { SRC_FAIRKEEP = 0, SRC_ETSY = 1, SRC_STATUS = 2, SRC_SKY 
 enum FkMode : uint8_t { FK_TOTAL = 0, FK_POS, FK_WEB, FK_ALL, FK_COUNT };
 enum EtMode : uint8_t { ET_TODAY = 0, ET_MONTH, ET_YEAR, ET_SHIP, ET_COUNT };
 enum StMode : uint8_t { ST_ALL = 0, ST_SERVERS, ST_COUNT };
+// Sky source screens on the dial: Planes first, then the three sky-service screens
+// (dial screen i >= 1 is sky::ScreenId i - 1).
+enum SkyScr : uint8_t { DS_PLANES = 0, DS_STARLINK, DS_NASA, DS_SPY, DS_COUNT };
+static inline sky::ScreenId skyIdOf(int scr) { return (sky::ScreenId)(scr - 1); }
+#define DEFAULT_PLANE_URL "https://api.adsb.lol/v2/point"
 static const int ET_PERIODS = 3;   // today / month / year come as money periods; ET_SHIP is the to-ship count
 
 // ------------------------------------------------------------------ settings
@@ -62,27 +69,40 @@ struct Settings {
     String   skyKey, skyBase = DEFAULT_SKY_BASE;
     uint8_t  skyOn = 0b011;                // bit per sky::ScreenId; default Starlink + NASA
     uint8_t  skyCut[sky::SCR_COUNT] = { 60, 20, 20 };
-    uint8_t  skyMode = sky::SCR_STARLINK;
+    uint8_t  skyScr = DS_PLANES;           // dial screen, SkyScr
+    bool     plOn = true;                  // Planes screen on
+    uint8_t  plRadius = 25;                // nm, 5..100
+    uint8_t  plUnits = planes::U_NM_FT;
+    String   plUrl = DEFAULT_PLANE_URL, plKey;
+    uint32_t plDay = 500;                  // requests/day, 50..100000
+    uint16_t north = 0;                    // which way the top of the dial faces, 0..359
 
     const String &key() const  { return src == SRC_ETSY ? etKey : src == SRC_STATUS ? stKey : src == SRC_SKY ? skyKey : fkKey; }
     const String &base() const { return src == SRC_ETSY ? etBase : src == SRC_STATUS ? stBase : src == SRC_SKY ? skyBase : fkBase; }
     bool skyHasLoc() const { return !isnan(skyLat) && !isnan(skyLon); }
-    // enabled = switched on, and spy only with a key
-    bool skyEnabled(int id) const { return (skyOn >> id & 1) && (id != sky::SCR_SPY || skyKey.length()); }
+    // dial screen (SkyScr) enabled = switched on, and spy only with a key
+    bool skyEnabled(int scr) const {
+        if (scr == DS_PLANES) return plOn;
+        const int id = scr - 1;
+        return (skyOn >> id & 1) && (id != sky::SCR_SPY || skyKey.length());
+    }
 };
 
-// Next enabled sky screen after `from` (wraps); `from` itself if no other is enabled.
+// Next enabled dial screen after `from` (wraps); `from` itself if no other is enabled.
 static int skyNextEnabled(const Settings &s, int from) {
-    for (int k = 1; k < sky::SCR_COUNT; ++k) {
-        const int id = (from + k) % sky::SCR_COUNT;
+    for (int k = 1; k < DS_COUNT; ++k) {
+        const int id = (from + k) % DS_COUNT;
         if (s.skyEnabled(id)) return id;
     }
     return from;
 }
-// Keep skyMode on an enabled screen (it stays put if none is enabled).
+// Keep skyScr on an enabled screen (it stays put if none is enabled).
 static void skyFixMode(Settings &s) {
-    if (!s.skyEnabled(s.skyMode)) s.skyMode = skyNextEnabled(s, s.skyMode);
+    if (!s.skyEnabled(s.skyScr)) s.skyScr = skyNextEnabled(s, s.skyScr);
 }
+// Display units for the plane radius: nm, statute miles, km.
+static float unitPerNm(uint8_t u) { return u == planes::U_MI_FT ? 1.15078f : u == planes::U_KM_M ? 1.852f : 1.f; }
+static const char *unitName(uint8_t u) { return u == planes::U_MI_FT ? "mi" : u == planes::U_KM_M ? "km" : "nm"; }
 static Settings    g_set;
 static Preferences g_prefs;
 
@@ -118,7 +138,16 @@ static void loadSettings() {
     g_set.skyOn    = g_prefs.getUChar("skyon", 0b011) & 0b111;
     for (int i = 0; i < sky::SCR_COUNT; ++i)
         g_set.skyCut[i] = constrain(g_prefs.getUChar((String("skycut") + i).c_str(), sky::default_cut((sky::ScreenId)i)), 0, 85);
-    g_set.skyMode  = g_prefs.getUChar("skymode", sky::SCR_STARLINK) % sky::SCR_COUNT;
+    // 1.4.0-beta1 kept the sky-service screen in "skymode"; the dial list now has Planes first.
+    if (g_prefs.isKey("skyscr")) g_set.skyScr = g_prefs.getUChar("skyscr", DS_PLANES) % DS_COUNT;
+    else                         g_set.skyScr = g_prefs.getUChar("skymode", sky::SCR_STARLINK) % sky::SCR_COUNT + 1;
+    g_set.plOn     = g_prefs.getBool("plon", true);
+    g_set.plRadius = constrain(g_prefs.getUChar("pradius", 25), 5, 100);
+    g_set.plUnits  = g_prefs.getUChar("punits", planes::U_NM_FT) % 3;
+    g_set.plUrl    = g_prefs.getString("purl", DEFAULT_PLANE_URL);
+    g_set.plKey    = g_prefs.getString("pkey", "");
+    g_set.plDay    = constrain(g_prefs.getUInt("pday", 500), 50u, 100000u);
+    g_set.north    = g_prefs.getUShort("north", 0) % 360;
     skyFixMode(g_set);
     g_prefs.end();
 }
@@ -150,7 +179,15 @@ static void saveSettings() {
     g_prefs.putString("skybase", g_set.skyBase);
     g_prefs.putUChar("skyon", g_set.skyOn);
     for (int i = 0; i < sky::SCR_COUNT; ++i) g_prefs.putUChar((String("skycut") + i).c_str(), g_set.skyCut[i]);
-    g_prefs.putUChar("skymode", g_set.skyMode);
+    g_prefs.putUChar("skyscr", g_set.skyScr);
+    if (g_set.skyScr != DS_PLANES) g_prefs.putUChar("skymode", skyIdOf(g_set.skyScr));   // for a downgrade
+    g_prefs.putBool("plon", g_set.plOn);
+    g_prefs.putUChar("pradius", g_set.plRadius);
+    g_prefs.putUChar("punits", g_set.plUnits);
+    g_prefs.putString("purl", g_set.plUrl);
+    g_prefs.putString("pkey", g_set.plKey);
+    g_prefs.putUInt("pday", g_set.plDay);
+    g_prefs.putUShort("north", g_set.north);
     g_prefs.end();
 }
 
@@ -204,6 +241,8 @@ static String            g_warn;           // non-fatal note from the server (e.
 static uint32_t          g_lastOkMs = 0;
 static uint8_t           g_dataSrc = 0xFF; // which source g_fk/g_et/g_lastOkMs belong to
 static volatile bool     g_fetchNow = true;
+static volatile uint8_t  g_plErr = PL_OK;  // last plane fetch outcome (PL_WAIT never stored)
+static volatile bool     g_plReady = false; // planes_begin succeeded (Sky selected)
 
 static String keyPrefix(const String &k) {
     return k.length() > 12 ? k.substring(0, 12) + "..." : (k.length() ? String("(set)") : String(""));
@@ -355,7 +394,18 @@ static void doFetch() {
     Serial.printf("[fetch] ok (%s)\n", src == SRC_ETSY ? "etsy" : src == SRC_STATUS ? "status" : "fairkeep");
 }
 
-// Sky: fetch task only. Lock order: g_lock is never taken while holding sky_lock.
+// The dial screens on show and (with auto-cycle) next. Caller holds g_lock. next = -1 if none.
+static void skyShownNext(int &shown, int &next) {
+    shown = g_set.skyScr;
+    next = -1;
+    if (g_set.cycleOn) {
+        const int nx = skyNextEnabled(g_set, shown);
+        if (nx != shown) next = nx;
+    }
+}
+
+// Sky: fetch task only. Lock order: g_lock is never taken while holding sky_lock or planes_lock.
+// Asks only for the sky-service screens on show / next; nothing when only Planes is involved.
 static void doSkyFetch() {
     SkyRequest r;
     xSemaphoreTake(g_lock, portMAX_DELAY);
@@ -363,12 +413,12 @@ static void doSkyFetch() {
     r.base = g_set.skyBase; r.key = g_set.skyKey; r.lat = g_set.skyLat; r.lon = g_set.skyLon;
     for (int i = 0; i < sky::SCR_COUNT; ++i) r.cuts[i] = g_set.skyCut[i];
     r.nIds = 0;
-    r.ids[r.nIds++] = (sky::ScreenId)g_set.skyMode;
-    if (g_set.cycleOn) {
-        const int nx = skyNextEnabled(g_set, g_set.skyMode);
-        if (nx != g_set.skyMode) r.ids[r.nIds++] = (sky::ScreenId)nx;
-    }
+    int shown, next;
+    skyShownNext(shown, next);
+    if (shown != DS_PLANES) r.ids[r.nIds++] = skyIdOf(shown);
+    if (next > DS_PLANES)   r.ids[r.nIds++] = skyIdOf(next);
     xSemaphoreGive(g_lock);
+    if (!r.nIds) return;
     int code = 0;
     const SkyErr e = sky_fetch(r, &code);
     String notice;
@@ -391,6 +441,27 @@ static void doSkyFetch() {
     Serial.printf("[sky] fetch %d (http %d)\n", (int)e, code);
 }
 
+// Planes: fetch task only, and only when the budget allows (planes_wait_s() == 0).
+static void doPlaneFetch() {
+    PlaneRequest r;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_set.src != SRC_SKY || !g_set.skyHasLoc()) { xSemaphoreGive(g_lock); return; }
+    r.url = g_set.plUrl; r.key = g_set.plKey; r.lat = g_set.skyLat; r.lon = g_set.skyLon;
+    r.radiusNm = g_set.plRadius;
+    r.perDay = (uint16_t)min<uint32_t>(g_set.plDay, 65535u);   // above ~2,880/day the 30 s floor rules anyway
+    xSemaphoreGive(g_lock);
+    const PlaneErr e = planes_fetch(r);
+    if (e == PL_WAIT) return;                       // budget says not yet: normal
+    g_plErr = e;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_set.src == SRC_SKY) {
+        if (e == PL_OK) { g_lastOkMs = millis(); g_dataSrc = SRC_SKY; }
+        g_dirty = true;
+    }
+    xSemaphoreGive(g_lock);
+    Serial.printf("[planes] fetch %d (next in %ld s)\n", (int)e, (long)planes_wait_s());
+}
+
 static void fetchTask(void *) {
     uint32_t last = 0;
     for (;;) {
@@ -398,15 +469,23 @@ static void fetchTask(void *) {
         const bool     isSky = g_set.src == SRC_SKY;
         const uint32_t period = isSky ? (uint32_t)sky_next_poll_s() * 1000UL : (uint32_t)g_set.pollS * 1000UL;
         const bool     hasKey = isSky ? g_set.skyHasLoc() : !g_set.key().isEmpty();
+        int shown = -1, next = -1;
+        if (isSky) skyShownNext(shown, next);
+        const bool planesWanted = isSky && g_plReady && g_set.plOn && (shown == DS_PLANES || next == DS_PLANES);
+        const bool skyWanted = !isSky || shown != DS_PLANES || next > DS_PLANES;
+        const bool routes = isSky && g_set.skyKey.length() > 0;
         xSemaphoreGive(g_lock);
-        if (g_fetchNow || (last == 0) || (millis() - last >= period)) {
-            if (WiFi.status() == WL_CONNECTED && hasKey) {
+        const bool online = WiFi.status() == WL_CONNECTED && hasKey;
+        if (skyWanted && (g_fetchNow || (last == 0) || (millis() - last >= period))) {
+            if (online) {
                 g_fetchNow = false;
                 if (isSky) doSkyFetch();
                 else       doFetch();
                 last = millis();
             }
         }
+        if (online && planesWanted && planes_wait_s() == 0) doPlaneFetch();
+        if (online && routes) planes_route_tick();
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
@@ -573,9 +652,9 @@ static void renderView() {
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_set.src == SRC_SKY) {          // the scope draws itself (skyFrame); only the page dots here
         int nEn = 0, active = 0;
-        for (int i = 0; i < sky::SCR_COUNT; ++i) {
+        for (int i = 0; i < DS_COUNT; ++i) {
             if (!g_set.skyEnabled(i)) continue;
-            if (i == g_set.skyMode) active = nEn;
+            if (i == g_set.skyScr) active = nEn;
             nEn++;
         }
         const int count = !(g_set.tapCycles || g_set.cycleOn) ? 0 : nEn;
@@ -593,11 +672,13 @@ static void renderView() {
 }
 
 // One scope frame from the current sky reply. UI loop (core 1) only. g_set is written only on
-// this core (web page, taps), so reading skyMode/skyCut here needs no g_lock.
+// this core (web page, taps), so reading skyScr/skyCut here needs no g_lock.
 static void skyFrame() {
     static ScopeDot dots[sky::MAX_OBJ];
     static int      objIx[sky::MAX_OBJ];     // dots[k] shows s->obj[objIx[k]]
-    const int id = g_set.skyMode, cut = g_set.skyCut[id];
+    const int id = skyIdOf(g_set.skyScr), cut = g_set.skyCut[id], north = g_set.north;
+    scope_set_north(north);
+    scope_set_ring_labels("", "", "");
     char hdr[48], l1[64] = "", l2[96] = "", foot[64] = "";
     snprintf(hdr, sizeof(hdr), "%s", sky::screen_title((sky::ScreenId)id));
     int n = 0;
@@ -622,11 +703,13 @@ static void skyFrame() {
             ranOut = false;
             int x, y;
             if (!sky::project(az, el, cut, SCOPE_R, x, y)) continue;   // below the cutoff: hidden
+            sky::rotate(x, y, north);
             ScopeDot &d = dots[n];
             d.x = x; d.y = y; d.ntail = 0;
             for (int k = 0; k < 2; ++k) {
                 float a2, e2; int x2, y2;
                 if (sky::position(o, t - 6.f * (k + 1), a2, e2) && sky::project(a2, e2, cut, SCOPE_R, x2, y2)) {
+                    sky::rotate(x2, y2, north);
                     d.tx[d.ntail] = x2; d.ty[d.ntail] = y2; d.ntail++;
                 } else break;
             }
@@ -666,17 +749,114 @@ static void skyFrame() {
     scope_set_text(hdr, l1, l2, foot);
 }
 
+// One scope frame of the Planes screen (map view: centre = the dial's location, rim = radius).
+// UI loop only; positions are dead-reckoned from the reply's report time to now.
+static char g_routeWanted[9] = "";           // callsign last passed to planes_route_want
+
+static void planeFrame() {
+    static ScopeDot dots[planes::MAX_AC];
+    const int north = g_set.north;
+    const uint8_t units = g_set.plUnits;
+    const float radiusNm = g_set.plRadius, perNm = unitPerNm(units);
+    const char *un = unitName(units);
+    const double oLat = g_set.skyLat, oLon = g_set.skyLon;
+    const bool keyed = g_set.skyKey.length() > 0;
+    const int rDisp = (int)lroundf(radiusNm * perNm);
+    {
+        char a[12], b[12], c[16];
+        snprintf(a, sizeof(a), "%d", (int)lroundf(rDisp / 3.f));
+        snprintf(b, sizeof(b), "%d", (int)lroundf(rDisp * 2 / 3.f));
+        snprintf(c, sizeof(c), "%d %s", rDisp, un);
+        scope_set_north(north);
+        scope_set_ring_labels(a, b, c);
+    }
+    char hdr[48], l1[64] = "", l2[96] = "", foot[64] = "";
+    snprintf(hdr, sizeof(hdr), "PLANES");
+    int n = 0, best = -1;
+    bool haveReply = false;
+    planes::Aircraft near{};
+    planes_lock();
+    const planes::Reply *rp = planes_reply();
+    if (rp) {
+        haveReply = true;
+        const float dt = (uint32_t)(millis() - planes_reply_ms()) / 1000.f;   // positions are as of the reply
+        float bestD = 1e9f;
+        for (int i = 0; i < rp->n && n < planes::MAX_AC; ++i) {
+            const planes::Aircraft &a = rp->ac[i];
+            double la, lo; int x, y;
+            planes::dead_reckon(a, dt, la, lo);
+            if (!planes::project(oLat, oLon, la, lo, radiusNm, SCOPE_R, x, y)) continue;   // outside the rim
+            sky::rotate(x, y, north);
+            ScopeDot &d = dots[n];
+            d.x = x; d.y = y; d.ntail = 0;
+            for (int k = 0; k < 2; ++k) {
+                double la2, lo2; int x2, y2;
+                planes::dead_reckon(a, dt - 10.f * (k + 1), la2, lo2);
+                if (!planes::project(oLat, oLon, la2, lo2, radiusNm, SCOPE_R, x2, y2)) break;
+                sky::rotate(x2, y2, north);
+                d.tx[d.ntail] = x2; d.ty[d.ntail] = y2; d.ntail++;
+            }
+            d.style = a.alt_ft == planes::ALT_GROUND ? SD_HOLLOW : SD_FILL;
+            const float dist = planes::distance_nm(oLat, oLon, la, lo);
+            if (dist < bestD) { bestD = dist; best = n; near = a; }
+            n++;
+        }
+    }
+    planes_unlock();
+
+    bool routeShown = false;
+    if (!haveReply) {
+        snprintf(l1, sizeof(l1), "loading...");
+    } else {
+        snprintf(hdr, sizeof(hdr), "PLANES  -  %d within %d %s", n, rDisp, un);
+        if (best < 0) {
+            snprintf(l1, sizeof(l1), "no planes within %d %s", rDisp, un);
+        } else {
+            dots[best].style |= SD_HILITE;
+            planes::readout(l1, sizeof(l1), l2, sizeof(l2), near, (planes::Units)units);
+            if (keyed && near.flight[0]) {        // routes only on key-holding dials (planes_route_* lock themselves)
+                if (strcmp(g_routeWanted, near.flight)) {
+                    strlcpy(g_routeWanted, near.flight, sizeof(g_routeWanted));
+                    planes_route_want(near.flight);
+                }
+                char rt[24];
+                if (planes_route_get(near.flight, rt, sizeof(rt))) {
+                    strlcat(l2, "  -  ", sizeof(l2));
+                    strlcat(l2, rt, sizeof(l2));
+                    routeShown = true;
+                }
+            }
+        }
+    }
+    const uint8_t err = g_plErr;
+    const int32_t wait = planes_wait_s();
+    if (err == PL_LIMITED)                                                   snprintf(foot, sizeof(foot), "plane data limit reached - waiting");
+    else if (err == PL_UNREACHABLE || err == PL_HTTP || err == PL_BAD_REPLY) snprintf(foot, sizeof(foot), "plane data unreachable");
+    else if (err == PL_NO_MEMORY)                                            snprintf(foot, sizeof(foot), "not enough memory for planes");
+    else if (wait < 0)                                                       snprintf(foot, sizeof(foot), "daily plane limit reached");
+    else if (routeShown)                                                     snprintf(foot, sizeof(foot), "routes: adsbdb.com");
+    else if (wait > 90)                                                      snprintf(foot, sizeof(foot), "refresh in %ld min", (long)((wait + 59) / 60));
+    scope_set_dots(dots, n);
+    scope_set_text(hdr, l1, l2, foot);
+}
+
 // Sky selected: buffers + scope; another source: free everything Sky. UI core only
 // (setup and handleSave), never the fetch task.
 static void skyActivate(bool on) {
     if (on) {
         if (!sky_begin()) { setError("Not enough memory for Sky"); return; }
+        g_plReady = planes_begin();            // Planes alone may fail; the sky screens still work
+        if (!g_plReady) g_plErr = PL_NO_MEMORY;
         ui_set_scope_mode(true);
         scope_open(ui_screen());
         if (ui_menu_open()) ui_menu_hide();   // the scope is created above the menu
     } else {
         scope_close();
         ui_set_scope_mode(false);
+        g_plReady = false;
+        planes_end();
+        g_routeWanted[0] = 0;
+        g_plErr = PL_OK;
         sky_end();
     }
 }
@@ -831,7 +1011,7 @@ static void handleRoot() {
     if (warn.length()) status += "<br><span class=err>" + htmlEscape(warn) + "</span>";
 
     static const char *srcNames[SRC_COUNT] = { "FairKeep (today's POS + web sales)", "Etsy (via an Etsy dial service)",
-                                                "Server status (via a status service)", "Sky (satellites overhead)" };
+                                                "Server status (via a status service)", "Sky (planes and satellites overhead)" };
     static const char *fkNames[FK_COUNT] = { "Total (POS + web)", "POS only", "Web only", "All three" };
     static const char *etNames[ET_COUNT] = { "Today", "This month", "This year", "To ship" };
     static const char *stNames[ST_COUNT] = { "Everything", "Servers (CPU)" };
@@ -885,13 +1065,30 @@ static void handleRoot() {
         p += "<label>Longitude</label><input name=skylon inputmode=decimal value='" + (s.skyHasLoc() ? String(s.skyLon, 4) : String()) + "' placeholder='-71.3172'>";
         p += "<p class=sub style='margin:6px 0 0'>Look yours up at <a style='color:#f2a93b' href='https://www.latlong.net/' target=_blank rel=noopener>latlong.net</a>. "
              "Sent to the sky service rounded to 0.1&deg; (about 10 km).</p>";
+        {
+            static const char *unitNames[3] = { "nautical miles / feet", "miles / feet", "kilometres / metres" };
+            const float f = unitPerNm(s.plUnits);
+            p += checkbox("plon", s.plOn, "Planes");
+            p += "<label>Planes within (" + String(unitName(s.plUnits)) + ", " + String((int)lroundf(5 * f)) + "&ndash;" +
+                 String((int)lroundf(100 * f)) + ")</label><input type=number name=pradius min=" + String((int)lroundf(5 * f)) +
+                 " max=" + String((int)lroundf(100 * f)) + " value=" + String((int)lroundf(s.plRadius * f)) + ">";
+            p += "<input type=hidden name=punitsold value=" + String(s.plUnits) + ">";
+            p += "<label>Units</label><select name=punits>" + options(unitNames, 3, s.plUnits) + "</select>";
+        }
         for (int i = 0; i < sky::SCR_COUNT; ++i) {
             if (i == sky::SCR_SPY && s.skyKey.isEmpty()) continue;
             p += checkbox((String("skyon") + i).c_str(), s.skyOn >> i & 1, rows[i]);
             p += "<label>Show objects above (degrees, 0&ndash;85)</label><input type=number min=0 max=85 name=skycut" + String(i) + " value=" + String(s.skyCut[i]) + ">";
         }
+        p += "<label>North offset (degrees, 0&ndash;359)</label><input type=number min=0 max=359 name=north value=" + String(s.north) + ">";
+        p += "<p class=sub style='margin:6px 0 0'>Which way the top of the dial faces, in degrees clockwise from north (0 = north, 90 = east). "
+             "Turns the scopes; text stays upright.</p>";
         p += "<label>Sky key (optional)</label>" + keyField("skykey", s.skyKey, "only if you were given one");
-        p += "<label>Sky service URL</label><input name=skybase value='" + htmlEscape(s.skyBase) + "'></div>";
+        p += "<label>Sky service URL</label><input name=skybase value='" + htmlEscape(s.skyBase) + "'>";
+        p += "<label>Plane data URL</label><input name=purl value='" + htmlEscape(s.plUrl) + "'>";
+        p += "<label>Plane data key</label>" + keyField("pkey", s.plKey, "optional adsb.lol key");
+        p += "<label>Plane requests per day (50&ndash;100000)</label><input type=number min=50 max=100000 name=pday value=" + String(s.plDay) + ">";
+        p += "<p class=sub style='margin:6px 0 0'>adsb.lol allows 500 a day without a key. The dial spreads them over the day and asks only while Planes is on screen.</p></div>";
     }
 
     p += "<div class=card><label>Refresh every (seconds, " + String(MIN_POLL_S) + "&ndash;" + String(MAX_POLL_S) + ")</label>";
@@ -940,6 +1137,8 @@ static void handleSave() {
     memcpy(oldCut, g_set.skyCut, sizeof(oldCut));
     k = g_web.arg("skykey"); k.trim();
     if (k.length()) g_set.skyKey = k;
+    k = g_web.arg("pkey"); k.trim();
+    if (k.length()) g_set.plKey = k;
     bool locBad = false;
     if (g_web.hasArg("skylat") || g_web.hasArg("skylon")) {
         String la = g_web.arg("skylat"), lo = g_web.arg("skylon");
@@ -959,7 +1158,16 @@ static void handleSave() {
             const String nm = String("skycut") + i;
             if (g_web.hasArg(nm)) g_set.skyCut[i] = constrain(g_web.arg(nm).toInt(), 0, 85);
         }
+        g_set.plOn = g_web.hasArg("plon");
     }
+    if (g_web.hasArg("pradius")) {                         // typed in the units the page showed
+        const uint8_t shownUnits = g_web.hasArg("punitsold") ? g_web.arg("punitsold").toInt() % 3 : g_set.plUnits;
+        const float v = g_web.arg("pradius").toFloat() / unitPerNm(shownUnits);
+        g_set.plRadius = constrain((int)lroundf(v), 5, 100);
+    }
+    if (g_web.hasArg("punits")) g_set.plUnits = g_web.arg("punits").toInt() % 3;
+    if (g_web.hasArg("pday"))   g_set.plDay = constrain(g_web.arg("pday").toInt(), 50L, 100000L);
+    if (g_web.hasArg("north"))  g_set.north = constrain(g_web.arg("north").toInt(), 0L, 359L);
     if (g_web.hasArg("src"))    { const int v = g_web.arg("src").toInt(); g_set.src = v >= 0 && v < SRC_COUNT ? v : SRC_FAIRKEEP; }
     if (g_web.hasArg("stmode")) g_set.stMode = g_web.arg("stmode").toInt() % ST_COUNT;
     if (g_web.hasArg("fkmode")) g_set.fkMode = g_web.arg("fkmode").toInt() % FK_COUNT;
@@ -980,6 +1188,8 @@ static void handleSave() {
     if (b.startsWith("https://")) g_set.stBase = b;
     b = g_web.arg("skybase"); b.trim();
     if (b.startsWith("https://")) g_set.skyBase = b;
+    b = g_web.arg("purl"); b.trim();
+    if (b.startsWith("https://")) g_set.plUrl = b;
     skyFixMode(g_set);
     const bool sameLoc = (isnan(oldLat) && isnan(g_set.skyLat) && isnan(oldLon) && isnan(g_set.skyLon)) ||
                          (oldLat == g_set.skyLat && oldLon == g_set.skyLon);
@@ -1073,16 +1283,16 @@ static void nextView() {
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_set.src == SRC_ETSY)        g_set.etMode = (g_set.etMode + 1) % ET_COUNT;
     else if (g_set.src == SRC_STATUS) g_set.stMode = (g_set.stMode + 1) % ST_COUNT;
-    else if (g_set.src == SRC_SKY)    g_set.skyMode = skyNextEnabled(g_set, g_set.skyMode);
+    else if (g_set.src == SRC_SKY)    g_set.skyScr = skyNextEnabled(g_set, g_set.skyScr);
     else                              g_set.fkMode = (g_set.fkMode + 1) % FK_COUNT;
     const bool sky = g_set.src == SRC_SKY;
-    const int  skyMode = g_set.skyMode;
+    const int  skyScr = g_set.skyScr;
     xSemaphoreGive(g_lock);
-    if (sky) {
+    if (sky && skyScr != DS_PLANES) {         // Planes: the fetch task asks when the budget allows
         // Fetch only if the reply on hand does not carry this screen (auto-cycle fetches the next one ahead).
         sky_lock();
         const sky::Reply *rp = sky_reply();
-        const bool inReply = rp && rp->scr[skyMode].state != sky::ST_NONE;
+        const bool inReply = rp && rp->scr[skyIdOf(skyScr)].state != sky::ST_NONE;
         sky_unlock();
         if (!inReply) g_fetchNow = true;
     }
@@ -1177,7 +1387,10 @@ static void refreshScreenState() {
     const uint8_t src = g_set.src;
     const bool hasLoc = g_set.skyHasLoc();
     xSemaphoreGive(g_lock);
-    if (src == SRC_SKY) { sky_lock(); have = sky_reply() != nullptr; sky_unlock(); }   // after g_lock is released
+    if (src == SRC_SKY) {                    // after g_lock is released
+        sky_lock(); have = sky_reply() != nullptr; sky_unlock();
+        if (!have) { planes_lock(); have = planes_reply() != nullptr; planes_unlock(); }
+    }
 
     if (!g_netUp) {
         ui_set_message("Set up WiFi", "On your phone, join\n" SETUP_AP_NAME "\nthen pick your network and paste your dial key.");
@@ -1336,7 +1549,8 @@ void loop() {
     static uint32_t lastFrame = 0;
     if (g_set.src == SRC_SKY && scope_is_open() && !g_screenOff && !ui_menu_open() && millis() - lastFrame >= 200) {
         lastFrame = millis();
-        skyFrame();
+        if (g_set.skyScr == DS_PLANES) planeFrame();
+        else                           skyFrame();
     }
 
     delay(5);
