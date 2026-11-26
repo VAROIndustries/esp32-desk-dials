@@ -35,6 +35,8 @@ Environment
   RATE_PER_MIN      per-address request limit, default 30 (1..10000)
   CALC_PER_SEC      global ceiling on fresh (uncached) calculations per second, default 10 (1..1000)
   SKY_NOTICE        optional display-only text sent to every dial
+  PLANETS_EPHEMERIS path of the JPL DE421 file for the planets screen, default /app/data/de421.bsp
+                    (baked into the image; never downloaded at run time)
 
 Two background threads: a ticker (engine.tick every TRACK_STEP_S) and a fetcher (downloads and
 screen rebuilds), so a slow download can never stall the dials.
@@ -54,6 +56,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+import planets as P
 import screens as S
 from engine import Engine, STALE_TICK_S, TRACK_STEP_S
 from store import (CELESTRAK_INTERVAL_S, HOBBY_INTERVAL_S, SATCAT_INTERVAL_S, Source, Store, decodo_get,
@@ -202,8 +205,9 @@ SLOW_DOWN = (429, {"error": "slow down", "poll": BUSY_POLL_S}, {"Retry-After": "
 
 
 class App:
-    def __init__(self, engine, store, env, clock=time.time):
+    def __init__(self, engine, store, env, clock=time.time, planets=None):
         self.engine, self.store, self.clock = engine, store, clock
+        self.planets = planets if planets is not None else P.Planets(env.get("PLANETS_EPHEMERIS", P.DEFAULT_PATH))
         self.spy_key = env.get("SKY_SPY_KEY", "")
         self.origin_secret = env.get("ORIGIN_SECRET", "")
         self.notice = env.get("SKY_NOTICE", "")[:120]
@@ -283,15 +287,21 @@ class App:
             return SLOW_DOWN
         keyed = key == "ok"
         visible = {n: cuts[n] for n in names if keyed or not S.SCREENS[n]["private"]}
+        sats = {n: c for n, c in visible.items() if n != S.PLANETS_SCREEN}   # the engine's screens
+        pcut = visible.get(S.PLANETS_SCREEN)                                  # None = not asked for
         # Approximate: a tick can land between is_cached and query_many, so a request counted as
         # cached may calculate after all. The ceiling bounds load; it is not an exact count.
-        fresh = not stalled and any(not self.engine.is_cached(n, lat, lon, c) for n, c in visible.items())
+        fresh = not stalled and (
+            any(not self.engine.is_cached(n, lat, lon, c) for n, c in sats.items())
+            or (pcut is not None and not self.planets.is_cached(lat, lon, pcut, self.engine.tick_time())))
         if fresh and not self.limiter.allow_global():
             return 503, {"error": "busy", "poll": BUSY_POLL_S}, {"Retry-After": str(BUSY_POLL_S)}
         if stalled:
             t0, results = None, {n: {"unavailable": True} for n in visible}
         else:
-            t0, results = self.engine.query_many(lat, lon, visible)   # one snapshot: every screen, one tick
+            t0, results = self.engine.query_many(lat, lon, sats)      # one snapshot: every screen, one tick
+            if pcut is not None:                                      # tracks from that same tick
+                results[S.PLANETS_SCREEN] = self.planets.query(lat, lon, pcut, t0)
         out = {n: results[n] if n in visible else {"locked": True} for n in names}
         spy = out.get("spy")
         if isinstance(spy, dict) and "count" in spy:                     # open, not locked/unavailable
@@ -614,7 +624,12 @@ def main():
     store = Store(env.get("DATA_DIR", "./data"), sources, requests_get, ua)
     store.load_disk()
     engine = Engine()
+    app = App(engine, store, env)
     now = time.time()
+    try:
+        app.planets.warm(now)                                   # load the ephemeris now (logs if missing)
+    except Exception as e:
+        _log_error(e)
     state = start_screens(engine, store, env, hobby_on, now)    # screens from the disk copies first
     tick_once(engine, now)                                      # a failure is logged; the ticker retries
     stop = threading.Event()
@@ -624,7 +639,7 @@ def main():
     port = int(env.get("PORT", "8080"))
     print(f"[sky] listening on :{port}; spy screen {'on' if env.get('SKY_SPY_KEY') else 'off'}, "
           f"extra source {'on' if hobby_on else 'off'}", flush=True)
-    SkyServer(("0.0.0.0", port), make_handler(App(engine, store, env))).serve_forever()
+    SkyServer(("0.0.0.0", port), make_handler(app)).serve_forever()
 
 
 if __name__ == "__main__":

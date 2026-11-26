@@ -118,6 +118,11 @@ class Engine:
         with self._lock:
             return float("inf") if self._t0 is None else now_unix - self._t0
 
+    def tick_time(self):
+        """Unix time of the last tick (the start of every track), or None before the first."""
+        with self._lock:
+            return self._t0
+
     def set_screens(self, built: dict, fetched: dict):
         """built: screen -> (elems, tags[, launch]) from screens.build_screens; fetched: screen -> unix time."""
         new = {name: _Screen(name, entry[0], entry[1], fetched.get(name, 0.0), *entry[2:3])

@@ -11,6 +11,7 @@ Screens (default cutoff, how far ahead the next pass is searched):
 | `bright` | satellites bright enough to see with the eye, only while it is dark where you are and only those in sunlight | 20 | 24 hours |
 | `gnss` | navigation satellites: GPS, Galileo, GLONASS and BeiDou, tagged `GPS`, `GAL`, `GLO`, `BDS` | 10 | 1 hour |
 | `new` | objects launched in the last 30 days, with days since launch | 20 | 2 hours |
+| `planets` | the Moon, Mercury, Venus, Mars, Jupiter and Saturn | 0 | next rise within 24 hours |
 
 One more screen needs a key (see `SKY_SPY_KEY` below).
 
@@ -49,6 +50,12 @@ Reply:
     the cutoff, in sunlight and in the dark at the same time. The Sun's position comes from a
     low-precision formula (about 0.01 degree), and Earth's shadow is treated as a cylinder:
     the penumbra, which lasts a few seconds of a pass, is ignored.
+  - `planets` objects are named `MOON`, `MERCURY`, `VENUS`, `MARS`, `JUPITER`, `SATURN` and
+    tagged `MOON` or `PLANET`; `age_h` is always 0. Their tracks start at the same time as the
+    satellite tracks of the same reply, so `lag_ms` applies to them too. Its `next` is the
+    first of the six to rise above the cutoff within 24 hours, `from` is the compass point it
+    rises at, and `max_el` is always 0. Positions are geometric (no atmospheric refraction),
+    like the satellites'.
 - `next` is only set when nothing is above the cutoff: `n`, `tag`, `in_s` (seconds until it
   rises), `from` (compass point it rises from), `max_el` (peak elevation within the search
   window). It is `null` when no pass rises inside the window. When no pass search could run
@@ -91,6 +98,14 @@ rows, or with malformed designators or dates, is refused.
 - Each source is stored in `DATA_DIR` as `<name>.dat` plus `<name>.state.json`, so the
   service answers straight after a restart, with no network, from the last good copy.
 
+The Moon and planets come from [Skyfield](https://rhodesmill.org/skyfield/) with JPL's DE421
+ephemeris (valid 1900 to 2050). The image downloads `de421.bsp` from
+`https://ssd.jpl.nasa.gov/ftp/eph/planets/bsp/` while it is built and fails the build unless
+the file matches the SHA-256 pinned in the `Dockerfile`; it is stored at `/app/data/de421.bsp`
+(not on the volume). Nothing is downloaded while the service runs: without the file the screen
+answers `unavailable`. The next rise is picked on a 10-minute table and then timed by Skyfield,
+so a body that peeks above the cutoff for under 10 minutes between two samples is missed.
+
 The calculation runs in the background every 5 seconds and the data is rebuilt after each
 download and at least hourly; requests only read the result.
 
@@ -108,6 +123,7 @@ All settings are environment variables. A bad value stops the service at start-u
 | `ORIGIN_SECRET` | At least 24 characters. When set, every request must carry this value in `X-Origin-Auth` (for example added by a Cloudflare rule) or gets a 403, and the caller address is read from `CF-Connecting-IP`. `/health` from the loopback address is always answered, for the container health check. When unset the service starts with a warning and accepts any caller. |
 | `SKY_SPY_KEY` | At least 24 characters. Switches on a key-gated screen, answered only to callers sending `Authorization: Bearer <key>`. The key is compared in constant time. Unset: the screen is always `locked`. |
 | `SKY_NOTICE` | Optional text (first 120 characters) sent to every dial as `notice`. |
+| `PLANETS_EPHEMERIS` | Path of the DE421 file for the `planets` screen. Default `/app/data/de421.bsp` (baked into the image). |
 
 ## Limits
 
@@ -145,3 +161,7 @@ label (`/v1/sky`, `/health` or `other`). Dials send a location rounded to 0.1 de
 
     pip install -r requirements-dev.txt
     python -m pytest -q
+
+The `planets` tests need `de421.bsp`: they use `$PLANETS_EPHEMERIS` if set, else download it
+once to `~/.cache/esp32-desk-dials/` (checked against the pinned SHA-256), and are skipped
+with the reason when neither works.

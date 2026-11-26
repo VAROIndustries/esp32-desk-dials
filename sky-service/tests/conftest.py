@@ -21,3 +21,45 @@ def omm(satnum, name="SAT", raan=211.2, ma=85.6, **over):
     row = dict(ISS_OMM, NORAD_CAT_ID=satnum, OBJECT_NAME=name, RA_OF_ASC_NODE=raan, MEAN_ANOMALY=ma)
     row.update(over)
     return row
+
+
+# JPL DE421 for the planets tests: $PLANETS_EPHEMERIS if that file exists, else a copy in the
+# user's cache folder, downloaded once (same URL and SHA-256 as the Dockerfile).
+DE421_URL = "https://ssd.jpl.nasa.gov/ftp/eph/planets/bsp/de421.bsp"
+DE421_SHA256 = "a20a7139da04cbc462454634918e9a9ca69127044e2cc9d4f9c16e238d2deedc"
+
+
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def de421_path():
+    """-> (path, None) or (None, reason the file could not be obtained)."""
+    given = os.environ.get("PLANETS_EPHEMERIS")
+    if given and os.path.isfile(given):
+        return given, None
+    cache = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "esp32-desk-dials")
+    path = os.path.join(cache, "de421.bsp")
+    if os.path.isfile(path) and _sha256(path) == DE421_SHA256:
+        return path, None
+    try:
+        import requests
+        os.makedirs(cache, exist_ok=True)
+        tmp = path + ".part"
+        with requests.get(DE421_URL, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    f.write(chunk)
+        if _sha256(tmp) != DE421_SHA256:
+            os.remove(tmp)
+            return None, "downloaded de421.bsp does not match the pinned SHA-256"
+        os.replace(tmp, path)
+        return path, None
+    except Exception as e:
+        return None, f"de421.bsp not available (set PLANETS_EPHEMERIS or allow the download): {type(e).__name__}"

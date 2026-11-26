@@ -1,4 +1,5 @@
-"""What each satellite screen shows: starlink, nasa, spy, bright, gnss, new.
+"""What each screen shows: satellites (starlink, nasa, spy, bright, gnss, new) and the Moon
+and planets (planets, calculated by planets.py, not from orbital elements).
 
 Edit NASA_IDS to change the NASA screen without touching the dial firmware.
 """
@@ -27,7 +28,9 @@ SCREENS = {
     "bright":   {"cut": 20, "horizon_s": 24 * 3600, "private": False},   # only in the dark, only sunlit
     "gnss":     {"cut": 10, "horizon_s": 60 * 60, "private": False},     # navigation satellites, tagged
     "new":      {"cut": 20, "horizon_s": 2 * 3600, "private": False},    # launched in the last 30 days
+    "planets":  {"cut": 0, "horizon_s": 24 * 3600, "private": False},    # Moon and planets (planets.py)
 }
+PLANETS_SCREEN = "planets"
 CUT_MIN, CUT_MAX = 0, 85
 MAX_SCREENS_PER_REQUEST = 3
 

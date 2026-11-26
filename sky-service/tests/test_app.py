@@ -43,7 +43,8 @@ def _ticked_engine():
     rows = [omm(1000 + i, f"S{i}", ma=85.6398 + (i - 40) * 0.01) for i in range(80)]
     elems = E.parse_omm_json(json.dumps(rows).encode())
     engine = Engine()
-    engine.set_screens({n: (elems, ["HOBBY"] * len(elems)) for n in S.SCREENS}, {n: T0 - 3600 for n in S.SCREENS})
+    sats = [n for n in S.SCREENS if n != S.PLANETS_SCREEN]
+    engine.set_screens({n: (elems, ["HOBBY"] * len(elems)) for n in sats}, {n: T0 - 3600 for n in sats})
     if not _TEMPLATE:
         engine.tick(T0)
         _TEMPLATE.append(engine)
