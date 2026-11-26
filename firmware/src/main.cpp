@@ -781,7 +781,7 @@ static void planeFrame() {
     char hdr[48], l1[64] = "", l2[96] = "", foot[64] = "";
     snprintf(hdr, sizeof(hdr), "PLANES");
     int n = 0, best = -1;
-    bool haveReply = false;
+    bool haveReply = false, stale = false;
     planes::Aircraft near{};
     planes_lock();
     const planes::Reply *rp = planes_reply();
@@ -789,7 +789,8 @@ static void planeFrame() {
         haveReply = true;
         const float dt = (uint32_t)(millis() - planes_reply_ms()) / 1000.f;   // positions are as of the reply
         float bestD = 1e9f;
-        for (int i = 0; i < rp->n && n < planes::MAX_AC; ++i) {
+        stale = dt > 600.f;      // dead reckoning past 10 min is guesswork: show nothing rather than drift
+        for (int i = 0; i < rp->n && n < planes::MAX_AC && !stale; ++i) {
             const planes::Aircraft &a = rp->ac[i];
             double la, lo; int x, y;
             planes::dead_reckon(a, dt, la, lo);
@@ -821,7 +822,9 @@ static void planeFrame() {
         snprintf(l1, sizeof(l1), "loading...");
     } else {
         snprintf(hdr, sizeof(hdr), "PLANES  -  %d within %d %s", n, rDisp, un);
-        if (best < 0) {
+        if (stale) {
+            snprintf(l1, sizeof(l1), "plane positions are over 10 min old");
+        } else if (best < 0) {
             snprintf(l1, sizeof(l1), "no planes within %d %s", rDisp, un);
         } else {
             dots[best].style |= SD_HILITE;
