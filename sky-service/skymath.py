@@ -1,4 +1,5 @@
-"""Observer geometry for the sky service: TEME positions -> azimuth / elevation / range.
+"""Observer geometry for the sky service: TEME positions -> azimuth / elevation / range,
+and where the Sun is (for "is the observer in the dark" and "is the satellite sunlit").
 
 Pure numpy, no I/O. Checked against Skyfield in tests/test_skymath.py.
 """
@@ -10,6 +11,7 @@ _A = 6378.137                    # WGS84 equatorial radius, km
 _F = 1 / 298.257223563
 _E2 = _F * (2 - _F)
 _COMPASS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+_AU_KM = 149597870.7
 
 
 def gmst(jd_ut1):
@@ -50,3 +52,41 @@ def compass(az_deg: float) -> str:
 
 def unix_to_jd(unix_s: float) -> float:
     return unix_s / 86400.0 + 2440587.5
+
+
+def sun_teme(jd):
+    """Geocentric apparent Sun position in km, TEME-like frame (true equator, equinox of date).
+
+    The Astronomical Almanac's low-precision formula (about 0.01 degree from 1950 to 2050).
+    The ~0.005 degree between the true and mean equinox (TEME's x axis) is ignored.
+    jd: a float or an array (T,) of Julian dates (UT). Returns (3,) or (T, 3).
+    """
+    n = np.asarray(jd, dtype=float) - 2451545.0
+    L = np.deg2rad((280.460 + 0.9856474 * n) % 360.0)
+    g = np.deg2rad((357.528 + 0.9856003 * n) % 360.0)
+    lam = L + np.deg2rad(1.915) * np.sin(g) + np.deg2rad(0.020) * np.sin(2 * g)
+    eps = np.deg2rad(23.439 - 0.0000004 * n)
+    dist = (1.00014 - 0.01671 * np.cos(g) - 0.00014 * np.cos(2 * g)) * _AU_KM
+    return np.stack([dist * np.cos(lam), dist * np.cos(eps) * np.sin(lam), dist * np.sin(eps) * np.sin(lam)], axis=-1)
+
+
+def sun_elevation(jd, lat_deg: float, lon_deg: float):
+    """Elevation of the Sun's centre in degrees (no refraction) for one or more Julian dates."""
+    jd = np.asarray(jd, dtype=float)
+    _, el, _ = azel(sun_teme(np.atleast_1d(jd)), np.atleast_1d(jd), lat_deg, lon_deg)
+    return el.reshape(jd.shape)
+
+
+def sunlit(r_teme, sun):
+    """True where a satellite at r_teme (..., 3) km is in sunlight, sun (..., 3) km broadcasting.
+
+    Earth's shadow is taken as a cylinder of the equatorial radius behind the Earth: enough to
+    say whether a satellite can be seen with the eye. The penumbra (a few seconds of a pass)
+    and the Earth's flattening are ignored.
+    """
+    r = np.asarray(r_teme, dtype=float)
+    s = np.asarray(sun, dtype=float)
+    s = s / np.linalg.norm(s, axis=-1, keepdims=True)
+    along = np.sum(r * s, axis=-1)
+    across = np.linalg.norm(r - along[..., None] * s, axis=-1)
+    return (along >= 0) | (across > _A)

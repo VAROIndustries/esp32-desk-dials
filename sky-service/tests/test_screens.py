@@ -126,3 +126,20 @@ def test_nasa_rename_keeps_every_other_field():
     out = S.build_screens(src, False, False, T0)[0]["nasa"][0][0]
     assert type(out) is Extra and out.name == "ISS" and out.note == "kept"
     assert (out.satnum, out.sat, out.intl, out.epoch) == (e.satnum, e.sat, e.intl, e.epoch)
+
+
+def test_bright_gnss_and_new_screens():
+    src = {"visual": _elems(omm(1, "BRIGHT")),
+           "gps-ops": _elems(omm(10, "GPS A")), "galileo": _elems(omm(11, "GAL A")),
+           "glo-ops": _elems(omm(12, "GLO A")), "beidou": _elems(omm(13, "BDS A"), omm(10, "DUP")),
+           "last-30-days": _elems(omm(20, "NEW A", OBJECT_ID="2019-200A"), omm(21, "NEW B", OBJECT_ID="2019-201A")),
+           S.SATCAT_SOURCE: {"2019-200A": T0 - 3 * DAY}}
+    built, dropped = S.build_screens(src, False, False, T0)
+    assert [e.name for e in built["bright"][0]] == ["BRIGHT"] and built["bright"][1] == [""]
+    elems, tags = built["gnss"]
+    assert [(e.name, t) for e, t in zip(elems, tags)] == [("GPS A", "GPS"), ("GAL A", "GAL"), ("GLO A", "GLO"), ("BDS A", "BDS")]
+    elems, tags, launch = built["new"]
+    assert [e.name for e in elems] == ["NEW A", "NEW B"] and launch == [T0 - 3 * DAY, None]
+    assert S.SATCAT_SOURCE not in dropped
+    assert set(S.GROUPS) >= {"visual", "gps-ops", "galileo", "glo-ops", "beidou", "last-30-days"}
+    assert all(S.GROUPS[n] == n for n in ("visual", "gps-ops", "galileo", "glo-ops", "beidou", "last-30-days"))

@@ -1,11 +1,12 @@
 """Parse and validate downloaded orbital elements before the service uses them.
 
-Two formats: CelesTrak GP data as OMM JSON, and classic TLE text (an extra TLE file, which may
-arrive as a zip archive holding that text).
+Two element formats: CelesTrak GP data as OMM JSON, and classic TLE text (an extra TLE file, which
+may arrive as a zip archive holding that text). Plus CelesTrak SATCAT JSON, used only for launch dates.
 Anything that fails validation raises ElementError; the caller keeps its last good copy.
 """
 from __future__ import annotations
 
+import datetime
 import io
 import json
 import math
@@ -110,6 +111,38 @@ def parse_omm_json(raw: bytes) -> list:
         except Exception:
             bad += 1
     return _finish(good, bad, len(rows))
+
+
+SATCAT_MAX_BYTES = 1024 * 1024
+SATCAT_MAX_ROWS = 2000
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def parse_satcat_json(raw: bytes) -> dict:
+    """CelesTrak SATCAT `FORMAT=json` body -> {international designator: launch day as unix time
+    (midnight UTC)}. Only OBJECT_ID and LAUNCH_DATE are read; rows failing either are invalid."""
+    if len(raw) > SATCAT_MAX_BYTES:
+        raise ElementError("file too large")
+    try:
+        rows = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError) as e:
+        raise ElementError(f"not JSON: {e}") from None
+    if not isinstance(rows, list):
+        raise ElementError("JSON is not a list")
+    if len(rows) > SATCAT_MAX_ROWS:
+        raise ElementError("too many objects")
+    good, bad = {}, 0
+    for row in rows:
+        try:
+            intl, day = row["OBJECT_ID"], row["LAUNCH_DATE"]
+            if not (isinstance(intl, str) and _INTL.fullmatch(intl) and isinstance(day, str) and _DATE.fullmatch(day)):
+                raise ValueError("bad row")
+            when = datetime.datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+            good[intl] = when.timestamp()
+        except Exception:
+            bad += 1
+    _finish(list(good), bad, len(rows))
+    return good
 
 
 def tle_checksum_ok(line: str) -> bool:

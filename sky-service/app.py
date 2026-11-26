@@ -56,7 +56,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import screens as S
 from engine import Engine, STALE_TICK_S, TRACK_STEP_S
-from store import CELESTRAK_INTERVAL_S, HOBBY_INTERVAL_S, Source, Store, decodo_get, requests_get
+from store import (CELESTRAK_INTERVAL_S, HOBBY_INTERVAL_S, SATCAT_INTERVAL_S, Source, Store, decodo_get,
+                   requests_get)
 
 POLL_S = 50                       # tracks are 60 s long; ask again before they run out
 BUSY_POLL_S = 300
@@ -490,6 +491,7 @@ def make_handler(app, slots=None):
 def build_sources(env):
     src = [Source(name, S.CELESTRAK.format(group=group), "omm", CELESTRAK_INTERVAL_S)
            for name, group in S.GROUPS.items() if name != "military" or env.get("SKY_SPY_KEY")]
+    src.append(Source(S.SATCAT_SOURCE, S.SATCAT_URL, "satcat", SATCAT_INTERVAL_S))   # celestrak.org too
     hobby_url = env.get("SPY_HOBBY_URL", "")
     hobby_on = bool(env.get("SKY_SPY_KEY")) and env.get("SPY_HOBBY", "1") != "0" and hobby_url.startswith("https://")
     if hobby_on:
@@ -510,7 +512,8 @@ def rebuild(engine, store, env, hobby_on, now):
                  if n in store.sources and store.sources[n].fetched_at is not None]
         return min(times) if times else 0.0
     fetched = {"starlink": oldest(["starlink"]), "nasa": oldest(["stations", "science", "resource"]),
-               "spy": oldest(["military", S.HOBBY_SOURCE])}
+               "spy": oldest(["military", S.HOBBY_SOURCE]), "bright": oldest(["visual"]),
+               "gnss": oldest(list(S.GNSS_TAGS)), "new": oldest(["last-30-days"])}
     engine.set_screens(built, fetched)
     engine.dropped = dropped
 

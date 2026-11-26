@@ -227,3 +227,34 @@ def test_unzip_tle_error_messages_never_contain_member_names():
         with pytest.raises(E.ElementError) as ei:
             E.unzip_tle(_zip(members))
         assert "SECRET" not in str(ei.value)
+
+
+# --- CelesTrak SATCAT rows (launch dates for the New launches screen) --------------------------
+
+def _satcat(*rows):
+    return json.dumps([{"OBJECT_NAME": "X", "OBJECT_ID": i, "NORAD_CAT_ID": 1, "LAUNCH_DATE": d} for i, d in rows]).encode()
+
+
+def test_satcat_good_file_maps_designator_to_launch_midnight_utc():
+    got = E.parse_satcat_json(_satcat(("2026-201A", "2026-11-20"), ("2026-201B", "2026-11-20"), ("2026-199C", "2026-11-18")))
+    assert got == {"2026-201A": 1795132800.0, "2026-201B": 1795132800.0, "2026-199C": 1794960000.0}
+
+
+@pytest.mark.parametrize("raw", [b"<html>blocked</html>", b'{"a":1}', b"[]",
+                                 _satcat(("2026-201A", "2026-11-20"), ("bad", "2026-11-20")),        # 50% invalid
+                                 _satcat(("2026-201A", "2026-11-20"), ("2026-201B", "20261120")),
+                                 _satcat(("2026-201A", "2026-11-20"), ("2026-201B", "2026-02-30"))])
+def test_satcat_rejects_bad_files(raw):
+    with pytest.raises(E.ElementError):
+        E.parse_satcat_json(raw)
+
+
+def test_satcat_size_and_row_caps(monkeypatch):
+    rows = [(f"2026-{i:03d}A", "2026-11-20") for i in range(1, 4)]
+    monkeypatch.setattr(E, "SATCAT_MAX_ROWS", 2)
+    with pytest.raises(E.ElementError, match="too many"):
+        E.parse_satcat_json(_satcat(*rows))
+    monkeypatch.setattr(E, "SATCAT_MAX_ROWS", 2000)
+    monkeypatch.setattr(E, "SATCAT_MAX_BYTES", 10)
+    with pytest.raises(E.ElementError, match="too large"):
+        E.parse_satcat_json(_satcat(*rows))

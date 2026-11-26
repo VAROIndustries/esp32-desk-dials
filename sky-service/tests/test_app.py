@@ -343,8 +343,10 @@ def test_worst_case_reply_fits_the_size_cap(tmp_path):
 
 def test_build_sources_fetches_spy_data_only_when_the_key_is_set():
     names = lambda env: sorted(s.name for s in A.build_sources(env)[0])
-    assert names({}) == ["resource", "science", "starlink", "stations"]
-    assert names({"SKY_SPY_KEY": "k"}) == ["military", "resource", "science", "starlink", "stations"]
+    public = ["beidou", "galileo", "glo-ops", "gps-ops", "last-30-days", "resource", "satcat", "science",
+              "starlink", "stations", "visual"]
+    assert names({}) == public
+    assert names({"SKY_SPY_KEY": "k"}) == sorted(public + ["military"])
     env = {"SKY_SPY_KEY": "k", "SPY_HOBBY_URL": "https://example.test/c.tle", "SPY_PROXY_URL": "http://u:p@proxy.test:1"}
     src, on = A.build_sources(env)
     hobby = [s for s in src if s.name == "hobby"][0]
@@ -893,3 +895,36 @@ def test_open_spy_screen_says_whether_the_hobby_list_is_loaded(tmp_path):
     body = app.handle(f"/v1/sky?{here}&screens=spy", key, "1.1.1.2")[1]
     assert body["screens"]["spy"]["hobby"] is True
     assert "hobby" not in app.handle(f"/v1/sky?{here}&screens=spy", {}, "1.1.1.3")[1]["screens"]["spy"]
+
+
+def test_new_celestrak_sources_keep_the_schedule_and_back_off_together(tmp_path):
+    """The six new groups (every 2 h) and SATCAT (every 6 h): at most one request per source per
+    interval, and a non-200 from any of them holds back every celestrak.org source."""
+    new = ["visual", "gps-ops", "galileo", "glo-ops", "beidou", "last-30-days", S.SATCAT_SOURCE]
+    srcs = [s for s in A.build_sources({})[0] if s.name in new]
+    assert {s.name: s.interval_s for s in srcs} == dict({n: 7200 for n in new[:-1]}, satcat=6 * 3600)
+    assert srcs[-1].url == "https://celestrak.org/satcat/records.php?GROUP=last-30-days&FORMAT=json"
+    satcat = json.dumps([{"OBJECT_ID": "1998-067A", "LAUNCH_DATE": "1998-11-20"}]).encode()
+    urls = []
+
+    def http(url, headers, proxy, timeout):
+        urls.append(url)
+        return 200, satcat if "/satcat/" in url else _omm_body(25544)
+    store = Store(str(tmp_path), srcs, http, "UA", log=lambda m: None)
+    state, eng = A.new_fetch_state(), Engine()
+    for k in range(7 * 3600 // 60):                                   # seven hours, one pass a minute
+        A.fetch_once(state, eng, store, {}, False, T0 + 60 * k)
+    assert {s.name: urls.count(s.url) for s in srcs} == dict({n: 4 for n in new[:-1]}, satcat=2)   # 0/2/4/6 h; 0/6 h
+    assert store.sources[S.SATCAT_SOURCE].elems == {"1998-067A": 911520000.0}
+    failing = Store(str(tmp_path / "f"), [s for s in A.build_sources({})[0] if s.name in new], FakeHttpStatus(403),
+                    "UA", log=lambda m: None)
+    failing.refresh(failing.sources[S.SATCAT_SOURCE], T0)
+    assert failing.due(T0 + 3599) == [] and len(failing.due(T0 + 3600)) == len(new)
+
+
+class FakeHttpStatus:
+    def __init__(self, status):
+        self.status = status
+
+    def __call__(self, url, headers, proxy, timeout):
+        return self.status, b""

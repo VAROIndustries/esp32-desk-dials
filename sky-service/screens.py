@@ -1,4 +1,4 @@
-"""What each satellite screen shows. Milestone 1: starlink, nasa, spy.
+"""What each satellite screen shows: starlink, nasa, spy, bright, gnss, new.
 
 Edit NASA_IDS to change the NASA screen without touching the dial firmware.
 """
@@ -24,6 +24,9 @@ SCREENS = {
     "starlink": {"cut": 60, "horizon_s": 20 * 60, "private": False},
     "nasa":     {"cut": 20, "horizon_s": 24 * 3600, "private": False},
     "spy":      {"cut": 20, "horizon_s": 24 * 3600, "private": True},
+    "bright":   {"cut": 20, "horizon_s": 24 * 3600, "private": False},   # only in the dark, only sunlit
+    "gnss":     {"cut": 10, "horizon_s": 60 * 60, "private": False},     # navigation satellites, tagged
+    "new":      {"cut": 20, "horizon_s": 2 * 3600, "private": False},    # launched in the last 30 days
 }
 CUT_MIN, CUT_MAX = 0, 85
 MAX_SCREENS_PER_REQUEST = 3
@@ -36,7 +39,18 @@ GROUPS = {
     "science": "science",
     "resource": "resource",
     "military": "military",
+    "visual": "visual",
+    "gps-ops": "gps-ops",
+    "galileo": "galileo",
+    "glo-ops": "glo-ops",
+    "beidou": "beidou",
+    "last-30-days": "last-30-days",
 }
+# gnss screen: source -> tag
+GNSS_TAGS = {"gps-ops": "GPS", "galileo": "GAL", "glo-ops": "GLO", "beidou": "BDS"}
+# Launch dates for the new screen (CelesTrak SATCAT records). Parsed to {intl designator: unix}.
+SATCAT_SOURCE = "satcat"
+SATCAT_URL = "https://celestrak.org/satcat/records.php?GROUP=last-30-days&FORMAT=json"
 HOBBY_SOURCE = "hobby"           # extra TLE file (SPY_HOBBY_URL), once a day
 
 # An orbit measured long ago predicts badly. These are judgement calls, not a standard.
@@ -48,8 +62,11 @@ MAX_FUTURE_EPOCH_S = 86400            # an orbit dated more than a day ahead is 
 def build_screens(sources: dict, spy_enabled: bool, hobby_enabled: bool, now: float):
     """sources: source name -> list[Elem] (missing or empty = not available).
 
+    sources[SATCAT_SOURCE], if present, is {international designator: launch unix time}.
+
     Returns (screens, dropped): screens is screen name -> (list[Elem], list[str] tags), with
-    empty screens left out; dropped is source name -> number of objects left out as too old
+    empty screens left out; the new screen has a third item, the launch time of each object
+    (unix, or None when unknown); dropped is source name -> number of objects left out as too old
     or dated in the future (for the NASA sources, only objects listed in NASA_IDS count).
     An object found in more than one source of a screen appears once, at its first place and
     with its first tag, using whichever copy has the newer element set.
@@ -95,4 +112,14 @@ def build_screens(sources: dict, spy_enabled: bool, hobby_enabled: bool, now: fl
         spy, tags = merge(groups)
         if spy:
             out["spy"] = (spy, tags)
+    v = fresh("visual")
+    if v:
+        out["bright"] = (v, [""] * len(v))
+    gnss, tags = merge((fresh(src), tag) for src, tag in GNSS_TAGS.items())
+    if gnss:
+        out["gnss"] = (gnss, tags)
+    new = fresh("last-30-days")
+    if new:
+        launches = sources.get(SATCAT_SOURCE) or {}
+        out["new"] = (new, [""] * len(new), [launches.get(e.intl) if e.intl else None for e in new])
     return out, dropped

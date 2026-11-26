@@ -14,6 +14,13 @@ positions) plus objects x steps x 1 byte of error flags, where steps is
 Rebuilds: set_screens() only stages a new screen set; queries keep using the current one
 until the next tick() has tracked the staged set (tracks and tables), then that tick swaps it in.
 
+Per-screen extras (in _tracks, and the mask passed to _search):
+  gnss   -> "by_tag": count per constellation tag over everything above the cutoff;
+  new    -> "d" on each object: whole days since launch, when the launch date is known;
+  bright -> "dark": whether the observer's Sun is below DARK_SUN_EL; objects (and "count")
+            only when dark, and then only those in sunlight; the next pass is the first one
+            that is above the cutoff, sunlit and in the observer's dark at the same time.
+
 Concurrency: one thread calls tick() and set_screens(); any number of threads query.
 A query takes one consistent snapshot under the lock (every screen from the same tick
 and element set), computes outside it, and caches only if that tick and element set
@@ -29,7 +36,7 @@ import numpy as np
 from sgp4.api import SatrecArray
 
 from screens import SCREENS
-from skymath import azel, compass, unix_to_jd
+from skymath import azel, compass, sun_elevation, sun_teme, sunlit, unix_to_jd
 
 TRACK_STEP_S = 5
 TRACK_POINTS = 13                 # 60 s of track
@@ -44,6 +51,8 @@ CACHE_MAX = 5000                  # pass-search cache entries (small: one pass e
 QCACHE_MAX = 256                  # per-tick results (up to ~116 KB each at 60 objects: ~30 MB)
 OLD_EPOCH_S = 14 * 86400          # objects measured longer ago than this are marked "old"
 STALE_TICK_S = 20                 # no tick for this long = the background loop has stalled
+DARK_SUN_EL = -6.0                # bright screen: the observer is "dark" below this Sun elevation
+GNSS_TAGS = ("GPS", "GAL", "GLO", "BDS")
 
 
 def _az(a) -> float:
@@ -78,13 +87,14 @@ class _Table:
 
 
 class _Screen:
-    def __init__(self, name, elems, tags, fetched_at):
+    def __init__(self, name, elems, tags, fetched_at, launch=None):
         self.name = name
         self.names = [e.name for e in elems]
         self.epochs = [e.epoch for e in elems]
         self.tags = list(tags)
         self.arr = SatrecArray([e.sat for e in elems])
         self.fetched_at = fetched_at   # unix time the elements were downloaded (0 = unknown)
+        self.launch = None if launch is None else list(launch)   # new screen: unix launch time or None
         self.r = None             # (N, TRACK_POINTS, 3) km TEME, filled by tick()
         self.ok = None            # (N,) bool: track propagated without error
         self.table = None         # _Table, filled by tick()
@@ -109,9 +119,9 @@ class Engine:
             return float("inf") if self._t0 is None else now_unix - self._t0
 
     def set_screens(self, built: dict, fetched: dict):
-        """built: screen -> (elems, tags) from screens.build_screens; fetched: screen -> unix time."""
-        new = {name: _Screen(name, elems, tags, fetched.get(name, 0.0))
-               for name, (elems, tags) in built.items()}
+        """built: screen -> (elems, tags[, launch]) from screens.build_screens; fetched: screen -> unix time."""
+        new = {name: _Screen(name, entry[0], entry[1], fetched.get(name, 0.0), *entry[2:3])
+               for name, entry in built.items()}
         with self._lock:
             self._staged = new          # queries keep the current screens until tick() swaps it in
 
@@ -210,7 +220,7 @@ class Engine:
                         val = None
                     else:
                         try:
-                            val = _search(sc, ok, table, t0, lat, lon, cut)
+                            val = _search(sc, ok, table, t0, lat, lon, cut, _mask(sc.name, lat, lon))
                         finally:
                             self._slots.release()
                         store_p[key] = (sc, None if table is None else table.built, t0, val)
@@ -252,7 +262,19 @@ class Engine:
     @staticmethod
     def _tracks(sc, r, ok, jd, t0, lat, lon, cut):
         az, el, _ = azel(r, jd, lat, lon)
-        up = np.flatnonzero(ok & (el[:, 0] >= cut))
+        keep = ok & (el[:, 0] >= cut)
+        extra = {}
+        if sc.name == "bright":
+            dark = bool(sun_elevation(jd[0], lat, lon) < DARK_SUN_EL)
+            keep &= dark & sunlit(r[:, 0], sun_teme(jd[0]))
+            extra["dark"] = dark
+        up = np.flatnonzero(keep)
+        if sc.name == "gnss":
+            counts = {tag: 0 for tag in GNSS_TAGS}
+            for i in up:
+                if sc.tags[i] in counts:
+                    counts[sc.tags[i]] += 1
+            extra["by_tag"] = counts
         order = up[np.argsort(-el[up, 0])][:MAX_OBJECTS]
         objects = []
         for i in order:
@@ -260,13 +282,28 @@ class Engine:
                    "trk": [[_az(a), round(float(e), 1)] for a, e in zip(az[i], el[i])]}
             if t0 - sc.epochs[i] > OLD_EPOCH_S:
                 obj["old"] = True
+            if sc.launch is not None and sc.launch[i] is not None:
+                obj["d"] = max(0, int((t0 - sc.launch[i]) // 86400))
             objects.append(obj)
         age_h = round((t0 - sc.fetched_at) / 3600.0, 1) if sc.fetched_at else -1.0
-        return {"count": int(up.size), "age_h": age_h, "objects": objects, "next": None}
+        return dict({"count": int(up.size), "age_h": age_h, "objects": objects, "next": None}, **extra)
 
 
-def _search(sc, ok, table, t0, lat, lon, cut):
-    """First pass rising after t0 and within the horizon, from the look-ahead table only."""
+def _mask(screen, lat, lon):
+    """The extra condition a pass must meet on this screen, or None. Called as
+    mask(r[objects, steps, 3], jd[steps]) -> bool[objects, steps]."""
+    if screen != "bright":
+        return None
+
+    def visible(r, jd):
+        sun = sun_teme(jd)                                     # (steps, 3)
+        return sunlit(r, sun[None]) & (sun_elevation(jd, lat, lon) < DARK_SUN_EL)[None]
+    return visible
+
+
+def _search(sc, ok, table, t0, lat, lon, cut, mask=None):
+    """First pass rising after t0 and within the horizon, from the look-ahead table only.
+    mask, if given, is ANDed with "above the cutoff" (see _mask)."""
     lo = int(np.searchsorted(table.t, t0, side="right"))
     hi = int(np.searchsorted(table.t, t0 + table.horizon_s, side="right"))
     if hi <= lo:
@@ -280,6 +317,8 @@ def _search(sc, ok, table, t0, lat, lon, cut):
         b = min(hi, a + rows)
         _, el, _ = azel(table.r[eligible, a:b], table.jd[a:b], lat, lon)
         above = el >= cut
+        if mask is not None:
+            above &= mask(table.r[eligible, a:b], table.jd[a:b])
         if not above.any():
             continue
         first = np.where(above.any(axis=1), above.argmax(axis=1), b - a)
@@ -287,6 +326,8 @@ def _search(sc, ok, table, t0, lat, lon, cut):
         i, j = int(eligible[idx]), a + int(first[idx])
         az_i, el_i, _ = azel(table.r[i:i + 1, j:hi], table.jd[j:hi], lat, lon)
         up = el_i[0] >= cut
+        if mask is not None:
+            up &= mask(table.r[i:i + 1, j:hi], table.jd[j:hi])[0]
         k = int(up.argmin()) if not up.all() else up.size   # end of this pass in the window
         return {"n": sc.names[i], "tag": sc.tags[i], "at": float(table.t[j]),
                 "from": compass(az_i[0, 0]), "max_el": int(round(float(el_i[0, :k].max())))}

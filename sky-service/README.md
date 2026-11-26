@@ -2,10 +2,17 @@
 
 Answers "what is overhead?" for the VARO Desk Dial **Sky** source. It downloads public
 orbital elements, does the orbit math once for every dial, and returns a small JSON reply.
-Screens: `starlink` (satellites above 60 degrees by default, next pass searched 20 minutes
-ahead) and `nasa` (a fixed list of nine NASA satellites above 20 degrees, next pass searched
-24 hours ahead; the list is `NASA_IDS` in `screens.py`). A third screen needs a key (see
-`SKY_SPY_KEY` below).
+Screens (default cutoff, how far ahead the next pass is searched):
+
+| Screen | What it shows | Cutoff | Next pass within |
+|---|---|---|---|
+| `starlink` | Starlink satellites | 60 | 20 minutes |
+| `nasa` | a fixed list of nine NASA satellites (`NASA_IDS` in `screens.py`) | 20 | 24 hours |
+| `bright` | satellites bright enough to see with the eye, only while it is dark where you are and only those in sunlight | 20 | 24 hours |
+| `gnss` | navigation satellites: GPS, Galileo, GLONASS and BeiDou, tagged `GPS`, `GAL`, `GLO`, `BDS` | 10 | 1 hour |
+| `new` | objects launched in the last 30 days, with days since launch | 20 | 2 hours |
+
+One more screen needs a key (see `SKY_SPY_KEY` below).
 
 ## API
 
@@ -31,6 +38,17 @@ Reply:
   An object is `n` (name), `tag`, and `trk`: 13 `[azimuth, elevation]` points, 5 seconds
   apart, starting at the time of the track. An object gets `"old": true` when its orbit was
   measured more than 14 days ago.
+- Extra fields on some screens:
+  - `gnss` has `by_tag`, the count per constellation (`{"GPS": 9, "GAL": 7, "GLO": 5, "BDS": 8}`)
+    over everything above the cutoff, not only the 60 objects sent.
+  - On `new`, an object has `d`, whole days since its launch, when the launch date is known
+    (it is left out when the launch-date list could not be downloaded).
+  - `bright` has `dark`: true when the Sun is more than 6 degrees below the horizon at the
+    location. When it is not dark, `count` is 0 and `objects` is empty. When it is dark, only
+    satellites in sunlight are counted and sent. Its `next` is the first pass that is above
+    the cutoff, in sunlight and in the dark at the same time. The Sun's position comes from a
+    low-precision formula (about 0.01 degree), and Earth's shadow is treated as a cylinder:
+    the penumbra, which lasts a few seconds of a pass, is ignored.
 - `next` is only set when nothing is above the cutoff: `n`, `tag`, `in_s` (seconds until it
   rises), `from` (compass point it rises from), `max_el` (peak elevation within the search
   window). It is `null` when no pass rises inside the window. When no pass search could run
@@ -51,13 +69,19 @@ the outcome of the last download. It answers 503 when no calculation has run for
 ## Data sources and their rules
 
 Orbital elements are CelesTrak GP data (`celestrak.org`): groups `starlink`, `stations`,
-`science` and `resource`. The NASA screen picks its satellites out of the last three.
+`science`, `resource`, `visual`, `gps-ops`, `galileo`, `glo-ops`, `beidou` and
+`last-30-days`. The NASA screen picks its satellites out of `stations`, `science` and
+`resource`. Launch dates for the `new` screen come from CelesTrak's satellite catalogue
+(`/satcat/records.php?GROUP=last-30-days&FORMAT=json`), fetched every 6 hours; only each
+object's international designator and launch date are used, and a file over 1 MB or 2,000
+rows, or with malformed designators or dates, is refused.
 
-- One group per request, each group at most every 2 hours, and at most one download a
-  minute across all groups. This follows CelesTrak's usage policy; do not shorten it.
+- One group per request, each group at most every 2 hours (the catalogue every 6), and at
+  most one download a minute across all of them. This follows CelesTrak's usage policy; do not shorten it.
 - On any answer other than HTTP 200, or any network, size or validation failure, that source
   is not asked again for 1 hour, then 2, doubling up to 24 hours, and the last good copy keeps
-  being served. The schedule is saved in `DATA_DIR`, so a restart never asks sooner.
+  being served. A non-200 answer or network failure from any `celestrak.org` address (the
+  catalogue included) holds back every `celestrak.org` source for that long. The schedule is saved in `DATA_DIR`, so a restart never asks sooner.
 - Downloads are HTTPS only, follow no redirects, ignore proxy settings in the environment, are
   refused above 8 MB and are abandoned after 120 seconds in total. The request's User-Agent
   names this project and `SKY_CONTACT`.
@@ -105,9 +129,10 @@ The image runs as a non-root user (`dial`, uid 10001) and needs the volume writa
 user. Put it behind your own HTTPS; set `ORIGIN_SECRET` if only a proxy such as Cloudflare
 should reach it. Then point the dial's sky-service address at your server.
 
-`python bench.py` checks that the machine is fast enough: 16,000 synthetic objects, an
-ordinary 5-second calculation must take under 1 second and the first one (which also builds
-the look-ahead table for pass searches) under 2.
+`python bench.py` checks that the machine is fast enough: 16,000 synthetic Starlink objects
+plus every other screen at a generous size, an ordinary 5-second calculation must take
+under 1 second and the first one (which also builds the look-ahead tables for pass
+searches) under 2.
 
 ## Privacy
 

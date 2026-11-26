@@ -49,6 +49,7 @@ from urllib.parse import urlsplit
 import elements
 
 CELESTRAK_INTERVAL_S = 2 * 3600      # GP data changes a few times a day; 2 h is polite
+SATCAT_INTERVAL_S = 6 * 3600         # launch dates (CelesTrak SATCAT): change only with new launches
 HOBBY_INTERVAL_S = 24 * 3600
 BACKOFF_MIN_S = 3600
 BACKOFF_MAX_S = 24 * 3600
@@ -81,7 +82,8 @@ class DownloadEncoded(DownloadError):
 class Source:
     """One element file kept fresh.
 
-    elems: the current elements ([] until the first good copy).
+    elems: the current elements ([] until the first good copy); for kind "satcat" a dict
+    {international designator: launch unix time} instead.
     fetched_at: unix time the current elements were downloaded, or None when never fetched or unknown.
     next_try: no request is made before this unix time. backoff: current back-off in seconds (0 = none).
     last: short status for health(), fixed text only. last_attempt: unix time the last request started,
@@ -141,6 +143,8 @@ class Store:
     def _parse(self, src, raw):
         if src.kind == "omm":
             return elements.parse_omm_json(raw)
+        if src.kind == "satcat":
+            return elements.parse_satcat_json(raw)        # {intl designator: launch unix time}
         if raw.startswith((b"PK\x03\x04", b"PK\x05\x06")):     # a zip archive (detected by content)
             return elements.parse_tle_text(elements.unzip_tle(raw))
         return elements.parse_tle_text(raw)

@@ -407,3 +407,66 @@ def test_pass_cache_does_not_keep_old_lookahead_tables_alive():
         assert eng.query("nasa", 42.0 + i, -71.3, 20)["next"] is not None   # stores a pass search
     gc.collect()
     assert [r() is not None for r in refs] == [False, False, True]
+
+
+# ---- milestone 3: per-screen extras for gnss, new and bright --------------------------------
+
+from skymath import sun_elevation, sun_teme, sunlit
+
+NIGHT_DT = 960        # at T0 + 960 s the ISS is overhead, sunlit, and the ground under it is dark
+NOON_DT = 2640        # at T0 + 2640 s it is overhead, sunlit, with the Sun 40 degrees up
+
+
+def _one(screen, rows, tags=None, launch=None, now=T0):
+    elems = _elems(rows)
+    entry = (elems, tags or [""] * len(elems)) + ((launch,) if launch is not None else ())
+    eng = Engine()
+    eng.set_screens({screen: entry}, {screen: now})
+    eng.tick(now)
+    return eng
+
+
+def test_gnss_counts_every_object_above_the_cutoff_by_tag():
+    lat, lon = _subpoint(T0)
+    rows = [omm(1000 + i, f"S{i}", ma=85.6398 + (i - 40) * 0.01) for i in range(80)]
+    tags = ["GPS"] * 30 + ["GAL"] * 30 + ["GLO"] * 20
+    out = _one("gnss", rows, tags).query("gnss", round(lat, 1), round(lon, 1), 30)
+    assert out["count"] == 80 and len(out["objects"]) == MAX_OBJECTS
+    assert out["by_tag"] == {"GPS": 30, "GAL": 30, "GLO": 20, "BDS": 0}
+
+
+def test_new_objects_carry_whole_days_since_launch_when_known():
+    lat, lon = _subpoint(T0)
+    eng = _one("new", [omm(1, "A"), omm(2, "B", ma=85.7)], launch=[T0 - 3.5 * 86400, None])
+    got = {o["n"]: o.get("d") for o in eng.query("new", round(lat, 1), round(lon, 1), 30)["objects"]}
+    assert got == {"A": 3, "B": None}
+
+
+def test_bright_is_empty_in_daylight_and_shows_only_sunlit_objects_in_the_dark():
+    now = T0 + NIGHT_DT
+    lat, lon = (round(v, 1) for v in _subpoint(now))
+    out = _one("bright", [omm(25544, "ISS")], now=now).query("bright", lat, lon, 20)
+    assert out["dark"] is True and out["count"] == 1 and out["objects"][0]["n"] == "ISS"
+    # the same object overhead at T0 is in Earth's shadow: dark, but nothing to see
+    lat0, lon0 = (round(v, 1) for v in _subpoint(T0))
+    out = _one("bright", [omm(25544, "ISS")]).query("bright", lat0, lon0, 20)
+    assert out["dark"] is True and out["count"] == 0 and out["objects"] == []
+    # local noon under the ISS: too bright, even though it is overhead and sunlit
+    noon = T0 + NOON_DT
+    lat, lon = (round(v, 1) for v in _subpoint(noon))
+    assert sun_elevation(unix_to_jd(noon), lat, lon) > 30
+    out = _one("bright", [omm(25544, "ISS")], now=noon).query("bright", lat, lon, 20)
+    assert out["dark"] is False and out["count"] == 0 and out["objects"] == []
+
+
+def test_bright_next_pass_is_one_that_can_be_seen():
+    nasa = _one("nasa", [omm(25544, "ISS")]).query("nasa", 42.0, -71.3, 20)["next"]
+    out = _one("bright", [omm(25544, "ISS")]).query("bright", 42.0, -71.3, 20)
+    assert out["dark"] is False                                      # Sun 25 degrees up at T0
+    nxt = out["next"]
+    assert nxt["n"] == "ISS" and nxt["in_s"] > nasa["in_s"]          # the first pass is in daylight
+    when = T0 + nxt["in_s"]
+    jd = unix_to_jd(when)
+    assert sun_elevation(jd, 42.0, -71.3) < -6
+    _, r, _ = Satrec.twoline2rv(ISS_L1, ISS_L2).sgp4(np.floor(jd), jd - np.floor(jd))
+    assert sunlit(np.array(r), sun_teme(jd)) and _iss_el(when, 42.0, -71.3) >= 19.0
