@@ -8,11 +8,11 @@ struct ScopeDot {
     int16_t x, y;                  // offset from the scope centre, px
     int16_t tx[2], ty[2];          // tail: 2 earlier positions (same frame), oldest last
     uint8_t ntail;                 // 0..2
-    uint8_t style;                 // SD_FILL, SD_HOLLOW (old / hobby), SD_HILITE (readout object)
+    uint8_t style;                 // SD_FILL, SD_HOLLOW (old / hobby), SD_HILITE (readout object), | SD_BIG (Moon)
     uint32_t rgb;                  // 0xRRGGBB; 0 = the theme's dot colour. A coloured SD_HILITE dot keeps
                                    // its colour and gets a white ring instead of the theme's hilite colour.
 };
-enum : uint8_t { SD_FILL = 0, SD_HOLLOW = 1, SD_HILITE = 2 };
+enum : uint8_t { SD_FILL = 0, SD_HOLLOW = 1, SD_HILITE = 2, SD_BIG = 4 };
 constexpr int SCOPE_R = 170;       // rim radius, px
 
 // Scope colour schemes (0xRRGGBB). Only the scope uses them; the screen behind it takes `bg`

@@ -24,7 +24,7 @@ static lv_obj_t *s_hdr, *s_big, *s_sub;
 static lv_obj_t *s_colHdr[2], *s_colVal[2], *s_colSub[2];
 static lv_obj_t *s_msgTitle, *s_msgBody;
 static lv_obj_t *s_status, *s_batt;
-#define MAX_DOTS 4
+#define MAX_DOTS 8                 // Sky: up to 8 dial screens
 static lv_obj_t *s_dots[MAX_DOTS];
 #define MAX_RING 96
 static lv_obj_t *s_ringDots[MAX_RING];

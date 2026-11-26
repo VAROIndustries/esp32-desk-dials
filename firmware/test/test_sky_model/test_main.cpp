@@ -4,7 +4,7 @@
 #include "sky_model.h"
 
 using namespace sky;
-static Reply R;   // ~60 KB: static, not on the stack
+static Reply R;   // ~60 KB+: static, not on the stack
 
 static const char *LIVE =
     "{\"t\":1795651652,\"poll\":50,\"lag_ms\":782,\"screens\":{"
@@ -98,7 +98,7 @@ static void test_project_zenith_rim_and_compass() {
 static void test_query_and_next_text() {
     char q[160];
     const ScreenId ids[] = { SCR_STARLINK, SCR_NASA };
-    const int cuts[SCR_COUNT] = { 45, 20, 20 };
+    const int cuts[SCR_COUNT] = { 45, 20, 20, 20, 10, 20, 0 };
     TEST_ASSERT_TRUE(build_query(q, sizeof(q), 41.9349f, -71.3172f, ids, 2, cuts) > 0);
     TEST_ASSERT_EQUAL_STRING("lat=41.9&lon=-71.3&screens=starlink,nasa&cut=starlink:45", q);
     TEST_ASSERT_EQUAL(-1, build_query(q, 10, 41.9f, -71.3f, ids, 2, cuts));
@@ -117,6 +117,56 @@ static void test_clean_text() {
     TEST_ASSERT_EQUAL_STRING("F00 ISS (ZARYA)x", b);
 }
 
+
+static void test_parses_the_m3_screens() {
+    std::string j = "{\"poll\":50,\"lag_ms\":0,\"screens\":{"
+        "\"gnss\":{\"count\":30,\"age_h\":1,\"by_tag\":{\"GPS\":9,\"GAL\":-4,\"GLO\":123456,\"BDS\":8,\"XYZ\":3},"
+        "\"objects\":[{\"n\":\"GPS BIIF-2\",\"tag\":\"GPS\",\"trk\":[[10,40]]}],\"next\":null},"
+        "\"new\":{\"count\":3,\"age_h\":1,\"objects\":["
+            "{\"n\":\"A\",\"tag\":\"\",\"d\":12,\"trk\":[[10,40]]},"
+            "{\"n\":\"B\",\"tag\":\"\",\"trk\":[[10,40]]},"
+            "{\"n\":\"C\",\"tag\":\"\",\"d\":99999,\"trk\":[[10,40]]}],\"next\":null},"
+        "\"bright\":{\"count\":0,\"age_h\":1,\"dark\":false,\"objects\":[],"
+            "\"next\":{\"n\":\"ISS (ZARYA)\",\"in_s\":3600,\"from\":\"W\",\"max_el\":50}},"
+        "\"planets\":{\"count\":1,\"age_h\":0,\"objects\":[{\"n\":\"MOON\",\"tag\":\"MOON\",\"trk\":[[100,30]]}],"
+            "\"next\":{\"n\":\"VENUS\",\"in_s\":11400,\"from\":\"E\",\"max_el\":0}}}}";
+    TEST_ASSERT_TRUE(parse(j.c_str(), j.size(), R));
+    const Screen &g = R.scr[SCR_GNSS];
+    TEST_ASSERT_EQUAL(ST_OK, g.state);
+    TEST_ASSERT_TRUE(g.have_by_tag);
+    TEST_ASSERT_EQUAL(9, g.by_tag[0]);                                // GPS
+    TEST_ASSERT_EQUAL(0, g.by_tag[1]);                                // GAL -4 clamped
+    TEST_ASSERT_EQUAL(9999, g.by_tag[2]);                             // GLO clamped
+    TEST_ASSERT_EQUAL(8, g.by_tag[3]);                                // BDS
+    TEST_ASSERT_EQUAL_STRING("GPS", g.obj[0].tag);
+    const Screen &nw = R.scr[SCR_NEW];
+    TEST_ASSERT_EQUAL(3, nw.n);
+    TEST_ASSERT_EQUAL(12, nw.obj[0].d);
+    TEST_ASSERT_EQUAL(-1, nw.obj[1].d);                               // not sent
+    TEST_ASSERT_EQUAL(-1, nw.obj[2].d);                               // out of range: dropped
+    TEST_ASSERT_FALSE(nw.have_by_tag);
+    const Screen &b = R.scr[SCR_BRIGHT];
+    TEST_ASSERT_EQUAL(0, b.dark);
+    TEST_ASSERT_EQUAL(-1, R.scr[SCR_GNSS].dark);                      // not said
+    TEST_ASSERT_TRUE(b.next.have);
+    const Screen &p = R.scr[SCR_PLANETS];
+    TEST_ASSERT_EQUAL(1, p.n);
+    TEST_ASSERT_EQUAL_STRING("MOON", p.obj[0].name);
+    TEST_ASSERT_EQUAL_STRING("MOON", p.obj[0].tag);
+    char t[64];
+    title_case(t, sizeof(t), p.obj[0].name);
+    TEST_ASSERT_EQUAL_STRING("Moon", t);
+    rise_text(t, sizeof(t), p.next);
+    TEST_ASSERT_EQUAL_STRING("Venus rises in 3 h 10 min, E", t);
+    TEST_ASSERT_EQUAL_STRING("N", compass8(359.f));
+    TEST_ASSERT_EQUAL_STRING("NE", compass8(30.f));
+    TEST_ASSERT_EQUAL_STRING("W", compass8(270.f));
+    TEST_ASSERT_EQUAL_STRING("NW", compass8(320.f));
+    TEST_ASSERT_EQUAL_STRING("planets", screen_key(SCR_PLANETS));
+    TEST_ASSERT_EQUAL(0, default_cut(SCR_PLANETS));
+    TEST_ASSERT_EQUAL(10, default_cut(SCR_GNSS));
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_parses_the_live_reply);
@@ -126,5 +176,6 @@ int main(int, char **) {
     RUN_TEST(test_project_zenith_rim_and_compass);
     RUN_TEST(test_query_and_next_text);
     RUN_TEST(test_clean_text);
+    RUN_TEST(test_parses_the_m3_screens);
     return UNITY_END();
 }

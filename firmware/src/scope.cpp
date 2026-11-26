@@ -85,7 +85,7 @@ static void draw_cb(lv_event_t *e) {
             }
         }
         const bool hi = d.style & SD_HILITE;
-        const int r = hi ? 7 : 5;
+        const int r = (hi ? 7 : 5) + ((d.style & SD_BIG) ? 4 : 0);
         lv_area_t da = { (lv_coord_t)(p0.x - r), (lv_coord_t)(p0.y - r), (lv_coord_t)(p0.x + r), (lv_coord_t)(p0.y + r) };
         const lv_color_t col = hi && !d.rgb ? C_HILITE : base;   // coloured dots keep their colour
         if (d.style & SD_HOLLOW) { dot.bg_opa = LV_OPA_TRANSP; dot.border_color = col; dot.border_width = 2; dot.border_opa = LV_OPA_COVER; }

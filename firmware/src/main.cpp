@@ -8,7 +8,8 @@
 //             (and optionally after postage labels too)
 //   Sky       GET {skyBase}/v1/sky       (no key; a sky key opens the Spy screen)
 //             + GET {plUrl}/<lat>/<lon>/<radius> (adsb.lol, on a daily request budget)
-//             screens: Planes / Starlink / NASA / Spy, drawn as a scope with moving dots
+//             screens: Planes / Starlink / NASA / Spy / Bright tonight / GPS and friends /
+//             New launches / Moon and planets, drawn as a scope with moving dots
 // Setup: first boot opens the DeskDial-Setup hotspot (WiFi + key). Afterwards
 // everything is on http://deskdial.local/ (or the dial's IP).
 // Touch: tap = next view (unless the view is locked), long-press = settings screen
@@ -40,9 +41,10 @@ enum Source : uint8_t { SRC_FAIRKEEP = 0, SRC_ETSY = 1, SRC_STATUS = 2, SRC_SKY 
 enum FkMode : uint8_t { FK_TOTAL = 0, FK_POS, FK_WEB, FK_ALL, FK_COUNT };
 enum EtMode : uint8_t { ET_TODAY = 0, ET_MONTH, ET_YEAR, ET_SHIP, ET_COUNT };
 enum StMode : uint8_t { ST_ALL = 0, ST_SERVERS, ST_COUNT };
-// Sky source screens on the dial: Planes first, then the three sky-service screens
-// (dial screen i >= 1 is sky::ScreenId i - 1).
-enum SkyScr : uint8_t { DS_PLANES = 0, DS_STARLINK, DS_NASA, DS_SPY, DS_COUNT };
+// Sky source screens on the dial: Planes first, then the sky-service screens
+// (dial screen i >= 1 is sky::ScreenId i - 1). Saved as "skyscr", so only ever append.
+enum SkyScr : uint8_t { DS_PLANES = 0, DS_STARLINK, DS_NASA, DS_SPY, DS_BRIGHT, DS_GNSS, DS_NEW, DS_PLANETS, DS_COUNT };
+static_assert(DS_COUNT == sky::SCR_COUNT + 1, "one dial screen per sky screen, plus Planes");
 static inline sky::ScreenId skyIdOf(int scr) { return (sky::ScreenId)(scr - 1); }
 #define DEFAULT_PLANE_URL "https://api.adsb.lol/v2/point"
 static const int ET_PERIODS = 3;   // today / month / year come as money periods; ET_SHIP is the to-ship count
@@ -67,8 +69,8 @@ struct Settings {
     uint8_t  cycleS = 15;        // ...every this many seconds
     float    skyLat = NAN, skyLon = NAN;   // NAN = not set
     String   skyKey, skyBase = DEFAULT_SKY_BASE;
-    uint8_t  skyOn = 0b011;                // bit per sky::ScreenId; default Starlink + NASA
-    uint8_t  skyCut[sky::SCR_COUNT] = { 60, 20, 20 };
+    uint8_t  skyOn = 0b1111011;            // bit per sky::ScreenId; default all but Spy
+    uint8_t  skyCut[sky::SCR_COUNT] = { 60, 20, 20, 20, 10, 20, 0 };
     uint8_t  skyScr = DS_PLANES;           // dial screen, SkyScr
     bool     plOn = true;                  // Planes screen on
     uint8_t  plRadius = 25;                // nm, 5..100
@@ -137,12 +139,13 @@ static void loadSettings() {
     if (!isfinite(g_set.skyLat) || !isfinite(g_set.skyLon)) g_set.skyLat = g_set.skyLon = NAN;
     g_set.skyKey   = g_prefs.getString("skykey", "");
     g_set.skyBase  = g_prefs.getString("skybase", DEFAULT_SKY_BASE);
-    g_set.skyOn    = g_prefs.getUChar("skyon", 0b011) & 0b111;
+    // "skyon" keeps the first three screens' bits (as before 1.4.0-beta3); "skyonx" the later ones.
+    g_set.skyOn    = (g_prefs.getUChar("skyon", 0b011) & 0b111) | ((g_prefs.getUChar("skyonx", 0b1111) & 0b1111) << 3);
     for (int i = 0; i < sky::SCR_COUNT; ++i)
         g_set.skyCut[i] = constrain(g_prefs.getUChar((String("skycut") + i).c_str(), sky::default_cut((sky::ScreenId)i)), 0, 85);
     // 1.4.0-beta1 kept the sky-service screen in "skymode"; the dial list now has Planes first.
     if (g_prefs.isKey("skyscr")) g_set.skyScr = g_prefs.getUChar("skyscr", DS_PLANES) % DS_COUNT;
-    else                         g_set.skyScr = g_prefs.getUChar("skymode", sky::SCR_STARLINK) % sky::SCR_COUNT + 1;
+    else                         g_set.skyScr = g_prefs.getUChar("skymode", sky::SCR_STARLINK) % 3 + 1;
     g_set.plOn     = g_prefs.getBool("plon", true);
     g_set.plRadius = constrain(g_prefs.getUChar("pradius", 25), 5, 100);
     g_set.plUnits  = g_prefs.getUChar("punits", planes::U_NM_FT) % 3;
@@ -181,10 +184,11 @@ static void saveSettings() {
     g_prefs.putFloat("skylon", g_set.skyLon);
     g_prefs.putString("skykey", g_set.skyKey);
     g_prefs.putString("skybase", g_set.skyBase);
-    g_prefs.putUChar("skyon", g_set.skyOn);
+    g_prefs.putUChar("skyon", g_set.skyOn & 0b111);
+    g_prefs.putUChar("skyonx", g_set.skyOn >> 3);
     for (int i = 0; i < sky::SCR_COUNT; ++i) g_prefs.putUChar((String("skycut") + i).c_str(), g_set.skyCut[i]);
     g_prefs.putUChar("skyscr", g_set.skyScr);
-    if (g_set.skyScr != DS_PLANES) g_prefs.putUChar("skymode", skyIdOf(g_set.skyScr));   // for a downgrade
+    if (g_set.skyScr != DS_PLANES && skyIdOf(g_set.skyScr) < 3) g_prefs.putUChar("skymode", skyIdOf(g_set.skyScr));   // for a downgrade
     g_prefs.putBool("plon", g_set.plOn);
     g_prefs.putUChar("pradius", g_set.plRadius);
     g_prefs.putUChar("punits", g_set.plUnits);
@@ -677,6 +681,29 @@ static void renderView() {
     ui_set_view(v);
 }
 
+// How far ahead the sky service looks for a pass, per screen (sky-service/screens.py horizon_s).
+static const char *passWindow(int id) {
+    return id == sky::SCR_STARLINK ? "20 min" : id == sky::SCR_GNSS ? "hour" : id == sky::SCR_NEW ? "2 h" : "24 h";
+}
+
+static uint32_t dimRgb(uint32_t c, int pct) {
+    const uint32_t r = (c >> 16 & 0xFF) * pct / 100, g = (c >> 8 & 0xFF) * pct / 100, b = (c & 0xFF) * pct / 100;
+    return r << 16 | g << 8 | b;
+}
+// Dot colour on the sky screens; 0 = the theme's dot colour. GNSS by constellation, Moon cream,
+// planets marigold; a little dimmer on the Mono theme so they do not glare against grey.
+static uint32_t skyDotRgb(int id, const char *tag, bool mono) {
+    static const uint32_t GNSS_RGB[sky::GNSS_TAGS] = { 0x4ADE80, 0x60A5FA, 0xF87171, 0xFACC15 };  // GPS GAL GLO BDS
+    uint32_t c = 0;
+    if (id == sky::SCR_GNSS) {
+        const int k = sky::gnss_index(tag);
+        if (k >= 0) c = GNSS_RGB[k];
+    } else if (id == sky::SCR_PLANETS) {
+        c = !strcmp(tag, "MOON") ? 0xF4EBDD : 0xF2A93B;
+    }
+    return c && mono ? dimRgb(c, 75) : c;
+}
+
 // One scope frame from the current sky reply. UI loop (core 1) only. g_set is written only on
 // this core (web page, taps), so reading skyScr/skyCut here needs no g_lock.
 static void skyFrame() {
@@ -684,8 +711,16 @@ static void skyFrame() {
     static int      objIx[sky::MAX_OBJ];     // dots[k] shows s->obj[objIx[k]]
     const int id = skyIdOf(g_set.skyScr), cut = g_set.skyCut[id], north = g_set.north;
     scope_set_north(north);
-    scope_set_ring_labels("", "", "");
-    char hdr[48], l1[64] = "", l2[96] = "", foot[64] = "";
+    if (id == sky::SCR_PLANETS) {                     // rim = the cutoff: the horizon by default
+        char rim[12];
+        if (cut == 0) snprintf(rim, sizeof(rim), "horizon");
+        else          snprintf(rim, sizeof(rim), "%d deg", cut);
+        scope_set_ring_labels("", "", rim);
+    } else {
+        scope_set_ring_labels("", "", "");
+    }
+    const bool mono = g_set.theme == TH_MONO;
+    char hdr[48], l1[64] = "", l2[128] = "", foot[64] = "";
     snprintf(hdr, sizeof(hdr), "%s", sky::screen_title((sky::ScreenId)id));
     int n = 0;
     sky_lock();
@@ -700,7 +735,7 @@ static void skyFrame() {
         snprintf(l1, sizeof(l1), "sky service unreachable.");
         snprintf(l2, sizeof(l2), "Check dial.varo.industries for status.");
     } else {
-        int best = -1; float bestEl = -99; bool anyHobby = false;
+        int best = -1; float bestEl = -99, bestAz = 0; bool anyHobby = false;
         bool ranOut = s->n > 0;              // true until some object still has a position at t
         for (int i = 0; i < s->n && n < sky::MAX_OBJ; ++i) {
             const sky::Obj &o = s->obj[i];
@@ -722,33 +757,67 @@ static void skyFrame() {
             const bool hobby = !strcmp(o.tag, "HOBBY");
             anyHobby |= hobby;
             d.style = (o.old || hobby) ? SD_HOLLOW : SD_FILL;
+            d.rgb = skyDotRgb(id, o.tag, mono);
+            if (!strcmp(o.tag, "MOON")) d.style |= SD_BIG;
             objIx[n] = i;
-            if (el > bestEl) { bestEl = el; best = n; }
+            if (el > bestEl) { bestEl = el; bestAz = az; best = n; }
             n++;
         }
         if (ranOut) {
             snprintf(l1, sizeof(l1), "sky service unreachable.");
             snprintf(l2, sizeof(l2), "Check dial.varo.industries for status.");
             n = 0;
+        } else if (id == sky::SCR_BRIGHT && s->dark == 0) {          // daylight or twilight: nothing to see
+            n = 0;
+            snprintf(l1, sizeof(l1), "Too bright out.");
+            char nx[96] = "none in the next 24 h";
+            if (s->next.have) sky::next_text(nx, sizeof(nx), s->next);
+            snprintf(l2, sizeof(l2), "Next visible: %s", nx);
+        } else if (best < 0 && id == sky::SCR_PLANETS) {
+            if (cut == 0) snprintf(l1, sizeof(l1), "nothing above the horizon");
+            else          snprintf(l1, sizeof(l1), "nothing above %d deg", cut);
+            if (s->next.have) sky::rise_text(l2, sizeof(l2), s->next);
+            else snprintf(l2, sizeof(l2), "nothing rises in the next 24 h");
         } else if (best < 0) {
             snprintf(l1, sizeof(l1), "nothing overhead");
             if (s->next.have) sky::next_text(l2, sizeof(l2), s->next);
-            else snprintf(l2, sizeof(l2), "no pass in the next %s", id == sky::SCR_STARLINK ? "20 min" : "24 h");
+            else snprintf(l2, sizeof(l2), "no pass in the next %s", passWindow(id));
         } else {
             dots[best].style |= SD_HILITE;
             const sky::Obj &o = s->obj[objIx[best]];
             const int el = (int)lroundf(bestEl);
+            const char *approx = o.old ? "  -  position approximate" : "";
             if (id == sky::SCR_STARLINK) {
                 snprintf(l1, sizeof(l1), "%ld overhead", (long)s->count);
-                snprintf(l2, sizeof(l2), "%s%s", o.name, o.old ? "  -  position approximate" : "");
+                snprintf(l2, sizeof(l2), "%s%s", o.name, approx);
+            } else if (id == sky::SCR_GNSS) {
+                if (s->have_by_tag)
+                    snprintf(l1, sizeof(l1), "GPS %d  GAL %d  GLO %d  BDS %d",
+                             s->by_tag[0], s->by_tag[1], s->by_tag[2], s->by_tag[3]);
+                else
+                    snprintf(l1, sizeof(l1), "%ld overhead", (long)s->count);
+                snprintf(l2, sizeof(l2), "%s%s", o.name, approx);
+            } else if (id == sky::SCR_NEW) {
+                snprintf(l1, sizeof(l1), "%s", o.name);
+                if (o.d == 0)      snprintf(l2, sizeof(l2), "launched today");
+                else if (o.d == 1) snprintf(l2, sizeof(l2), "launched 1 day ago");
+                else if (o.d > 1)  snprintf(l2, sizeof(l2), "launched %d days ago", (int)o.d);
+                // d not known (launch catalogue missing): line 2 stays empty
+            } else if (id == sky::SCR_PLANETS) {
+                sky::title_case(l1, sizeof(l1), o.name);
+                snprintf(l2, sizeof(l2), "%d deg up, %s", el, sky::compass8(bestAz));
+            } else if (id == sky::SCR_BRIGHT) {
+                snprintf(l1, sizeof(l1), "%s", o.name);
+                snprintf(l2, sizeof(l2), "%d deg up%s", el, approx);
             } else {
                 snprintf(l1, sizeof(l1), "%s%s%s", o.name, o.tag[0] ? "  -  " : "", o.tag);
-                snprintf(l2, sizeof(l2), "%d deg up%s", el, o.old ? "  -  position approximate" : "");
+                snprintf(l2, sizeof(l2), "%d deg up%s", el, approx);
             }
         }
         if (id == sky::SCR_SPY && anyHobby)           snprintf(foot, sizeof(foot), "amateur observations, may be inaccurate");
         else if (id == sky::SCR_SPY && s->hobby == 0) snprintf(foot, sizeof(foot), "military list only (amateur list not loaded)");
         else if (s->age_h > sky::OLD_DATA_H)          snprintf(foot, sizeof(foot), "data is old");
+        else if (id == sky::SCR_BRIGHT)               snprintf(foot, sizeof(foot), "naked-eye satellites");
     }
     sky_unlock();
     scope_set_dots(dots, n);
@@ -1081,7 +1150,10 @@ static void handleRoot() {
     p += "<label>Service URL</label><input name=stbase value='" + htmlEscape(s.stBase) + "'></div>";
 
     {
-        static const char *rows[sky::SCR_COUNT] = { "Starlink", "NASA (ISS, Hubble, Landsat...)", "Spy satellites" };
+        static const char *rows[sky::SCR_COUNT] = { "Starlink", "NASA (ISS, Hubble, Landsat...)", "Spy satellites",
+                                                    "Bright tonight (satellites you can see with the naked eye)",
+                                                    "GPS and friends (GPS, Galileo, GLONASS, BeiDou)",
+                                                    "New launches (last 30 days)", "Moon and planets" };
         p += "<div class=card><h2>Sky</h2>";
         p += "<label>Latitude</label><input name=skylat inputmode=decimal value='" + (s.skyHasLoc() ? String(s.skyLat, 4) : String()) + "' placeholder='41.9349'>";
         p += "<label>Longitude</label><input name=skylon inputmode=decimal value='" + (s.skyHasLoc() ? String(s.skyLon, 4) : String()) + "' placeholder='-71.3172'>";

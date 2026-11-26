@@ -6,9 +6,16 @@
 
 namespace sky {
 
-static const char *const KEYS[SCR_COUNT]   = { "starlink", "nasa", "spy" };
-static const char *const TITLES[SCR_COUNT] = { "STARLINK", "NASA", "SPY SATS" };
-static const int         CUTS[SCR_COUNT]   = { 60, 20, 20 };
+static const char *const KEYS[SCR_COUNT]   = { "starlink", "nasa", "spy", "bright", "gnss", "new", "planets" };
+static const char *const TITLES[SCR_COUNT] = { "STARLINK", "NASA", "SPY SATS", "BRIGHT TONIGHT",
+                                               "GPS AND FRIENDS", "NEW LAUNCHES", "MOON AND PLANETS" };
+static const int         CUTS[SCR_COUNT]   = { 60, 20, 20, 20, 10, 20, 0 };
+const char *const GNSS_TAG[GNSS_TAGS]      = { "GPS", "GAL", "GLO", "BDS" };
+
+int gnss_index(const char *tag) {
+    for (int i = 0; i < GNSS_TAGS; ++i) if (tag && !strcmp(tag, GNSS_TAG[i])) return i;
+    return -1;
+}
 
 const char *screen_key(ScreenId id)   { return id < SCR_COUNT ? KEYS[id] : ""; }
 const char *screen_title(ScreenId id) { return id < SCR_COUNT ? TITLES[id] : ""; }
@@ -41,12 +48,23 @@ static void parse_screen(JsonObjectConst js, Screen &s) {
     if (s.count < 0) s.count = 0;
     s.age_h = num(js["age_h"], 0);
     s.hobby = js["hobby"].is<bool>() ? (js["hobby"].as<bool>() ? 1 : 0) : -1;
+    s.dark  = js["dark"].is<bool>() ? (js["dark"].as<bool>() ? 1 : 0) : -1;
+    JsonObjectConst bt = js["by_tag"];
+    if (!bt.isNull()) {
+        s.have_by_tag = true;
+        for (int k = 0; k < GNSS_TAGS; ++k) {                 // only the known tags; anything else ignored
+            const float c = num(bt[GNSS_TAG[k]], 0);
+            s.by_tag[k] = (int16_t)(c < 0 ? 0 : c > MAX_TAG_COUNT ? MAX_TAG_COUNT : c);
+        }
+    }
     for (JsonObjectConst o : js["objects"].as<JsonArrayConst>()) {
         if (s.n >= MAX_OBJ) break;
         Obj &d = s.obj[s.n];
         clean_text(d.name, sizeof(d.name), o["n"] | "");
         clean_text(d.tag, sizeof(d.tag), o["tag"] | "");
         d.old = o["old"] | false;
+        const float days = num(o["d"], -1);
+        d.d = (days >= 0 && days <= MAX_DAYS) ? (int16_t)days : -1;
         d.npts = 0;
         for (JsonArrayConst p : o["trk"].as<JsonArrayConst>()) {
             if (d.npts >= TRK_PTS) break;
@@ -123,13 +141,49 @@ int build_query(char *out, size_t n, float lat, float lon, const ScreenId *ids, 
     return (w < 0 || (size_t)w >= n) ? -1 : w;
 }
 
+static void when_text(char *when, size_t n, int32_t in_s) {
+    const int32_t m = (in_s + 30) / 60;
+    if (m < 1)        snprintf(when, n, "now");
+    else if (m <= 90) snprintf(when, n, "in %ld min", (long)m);
+    else              snprintf(when, n, "in %ld h %ld min", (long)(m / 60), (long)(m % 60));
+}
+
 void next_text(char *out, size_t n, const Next &nx) {
-    const int32_t m = (nx.in_s + 30) / 60;
     char when[24];
-    if (m < 1)        snprintf(when, sizeof(when), "now");
-    else if (m <= 90) snprintf(when, sizeof(when), "in %ld min", (long)m);
-    else              snprintf(when, sizeof(when), "in %ld h %ld min", (long)(m / 60), (long)(m % 60));
+    when_text(when, sizeof(when), nx.in_s);
     snprintf(out, n, "%s %s, from %s, peaks %d deg up", nx.name, when, nx.from[0] ? nx.from : "?", (int)nx.max_el);
+}
+
+void rise_text(char *out, size_t n, const Next &nx) {
+    char when[24], name[NAME_LEN];
+    when_text(when, sizeof(when), nx.in_s);
+    title_case(name, sizeof(name), nx.name);
+    snprintf(out, n, "%s rises %s, %s", name, when, nx.from[0] ? nx.from : "?");
+}
+
+void title_case(char *out, size_t n, const char *src) {
+    if (!n) return;
+    size_t o = 0;
+    bool start = true;
+    for (const char *p = src ? src : ""; *p && o + 1 < n; ++p) {
+        char c = *p;
+        const bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        if (letter) {
+            if (start && c >= 'a') c = (char)(c - 'a' + 'A');
+            else if (!start && c <= 'Z') c = (char)(c - 'A' + 'a');
+        }
+        start = !letter && !(c >= '0' && c <= '9');
+        out[o++] = c;
+    }
+    out[o] = 0;
+}
+
+const char *compass8(float az) {
+    static const char *const P[8] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+    if (!isfinite(az)) return "?";
+    float a = fmodf(az, 360.f);
+    if (a < 0) a += 360.f;
+    return P[(int)((a + 22.5f) / 45.f) % 8];
 }
 
 void rotate(int &x, int &y, int northOffsetDeg) {
