@@ -881,3 +881,15 @@ def test_extra_source_uses_decodo_when_its_token_is_set():
     with pytest.raises(SystemExit, match="SPY_PROXY_KEY") as e:
         A.check_env({"SKY_CONTACT": "a@b.test", "SPY_PROXY_KEY": "bad token\n"})
     assert "bad token" not in str(e.value)
+
+
+def test_open_spy_screen_says_whether_the_hobby_list_is_loaded(tmp_path):
+    srcs = _sources("military", S.HOBBY_SOURCE)
+    app, here, _ = _app(tmp_path, {"SKY_SPY_KEY": "secret-key"}, sources=srcs)
+    key = {"authorization": "Bearer secret-key"}
+    body = app.handle(f"/v1/sky?{here}&screens=spy", key, "1.1.1.1")[1]
+    assert body["screens"]["spy"]["hobby"] is False                  # nothing loaded yet
+    app.store.sources[S.HOBBY_SOURCE].elems = [object()]
+    body = app.handle(f"/v1/sky?{here}&screens=spy", key, "1.1.1.2")[1]
+    assert body["screens"]["spy"]["hobby"] is True
+    assert "hobby" not in app.handle(f"/v1/sky?{here}&screens=spy", {}, "1.1.1.3")[1]["screens"]["spy"]

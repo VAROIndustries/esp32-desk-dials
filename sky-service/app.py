@@ -292,6 +292,10 @@ class App:
         else:
             t0, results = self.engine.query_many(lat, lon, visible)   # one snapshot: every screen, one tick
         out = {n: results[n] if n in visible else {"locked": True} for n in names}
+        spy = out.get("spy")
+        if isinstance(spy, dict) and "count" in spy:                     # open, not locked/unavailable
+            src = self.store.sources.get(S.HOBBY_SOURCE)
+            out["spy"] = dict(spy, hobby=bool(src is not None and src.elems))   # copy: results may be cached
         lag_ms = 0 if stalled else max(0, int((self.clock() - t0) * 1000))   # clock read after the query
         body = {"t": int(now), "poll": POLL_S, "lag_ms": lag_ms, "screens": out}
         if self.notice:
