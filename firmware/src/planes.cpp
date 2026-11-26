@@ -207,7 +207,7 @@ void setupHttp(HTTPClient &http) {
     http.setConnectTimeout(10000);
     http.setTimeout(READ_MS);
     http.setReuse(false);
-    http.useHTTP10(true);                          // plain Content-Length body, no chunking
+    http.useHTTP10(false);                         // adsb.lol answers HTTP/1.0 with 426; replies carry Content-Length (readBody stops there)
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);   // a key goes to its own host only
 }
 
