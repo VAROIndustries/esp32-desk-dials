@@ -673,6 +673,7 @@ static void skyActivate(bool on) {
         if (!sky_begin()) { setError("Not enough memory for Sky"); return; }
         ui_set_scope_mode(true);
         scope_open(ui_screen());
+        if (ui_menu_open()) ui_menu_hide();   // the scope is created above the menu
     } else {
         scope_close();
         ui_set_scope_mode(false);
